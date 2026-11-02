@@ -1,0 +1,46 @@
+name: court-watch
+
+on:
+  schedule:
+    # UTC 01:00-11:55 = 北京 09:00-19:55，正好覆盖系统开放时段。
+    # GitHub cron 最短 5 分钟，且高负载时可能延迟 5-20 分钟。
+    - cron: "*/5 1-11 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: court-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 去重状态跨运行传递：run_id 保证每次都能写新缓存，restore-keys 取最近一份。
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: .state
+          key: court-state-${{ github.run_id }}
+          restore-keys: |
+            court-state-
+
+      - name: Watch
+        env:
+          EHALL_COOKIE: ${{ secrets.EHALL_COOKIE }}
+          EHALL_UA: ${{ secrets.EHALL_UA }}
+          WXPUSHER_SPT: ${{ secrets.WXPUSHER_SPT }}
+        run: python -m src.cli watch

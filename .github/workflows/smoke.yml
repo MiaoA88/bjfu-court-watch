@@ -1,0 +1,31 @@
+name: smoke
+
+# 首次部署用来回答一个问题：GitHub runner 能不能访问 ehall？
+# 结论写在日志末尾的"判定"行里。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Probe reachability
+        env:
+          EHALL_COOKIE: ${{ secrets.EHALL_COOKIE }}
+          EHALL_UA: ${{ secrets.EHALL_UA }}
+        run: python -m src.cli smoke

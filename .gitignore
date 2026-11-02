@@ -1,0 +1,14 @@
+# 运行产物（不入库，也不手动删除）
+probe-out/
+.state/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# 本地私密配置（Cookie / SPT 绝不入库）
+.env
+*.local.yaml
