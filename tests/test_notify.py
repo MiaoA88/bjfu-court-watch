@@ -94,6 +94,13 @@ def test_logging_notifier_records_without_network():
     assert sink.sent == [("t", "body", "https://x")]
 
 
+def test_delivers_flag_guards_dedup_bookkeeping():
+    """只有真正投递的通道才能让调用方记账，否则配好 SPT 后会漏推。"""
+    assert WxPusherSpt("SPT_x").delivers is True
+    assert LoggingNotifier().delivers is False
+    assert ConsoleNotifier().delivers is False
+
+
 def test_console_notifier_records_messages():
     sink = ConsoleNotifier()
     sink.send("t", "body", None)

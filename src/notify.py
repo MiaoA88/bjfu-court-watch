@@ -30,6 +30,10 @@ class Notifier(Protocol):
 
 
 class WxPusherSpt:
+    #: 是否真的把消息投递出去了。去重记账只认 True 的通道，
+    #: 否则"没配 SPT 只记日志"的那一轮会把空场标记成已推送，真正配好后反而漏推。
+    delivers = True
+
     def __init__(
         self,
         spt: str,
@@ -85,6 +89,8 @@ class LoggingNotifier:
     日志里仍然能看到本轮命中了什么，配好 SPT 后自动转为真实推送。
     """
 
+    delivers = False
+
     def __init__(self) -> None:
         self.sent: list[tuple[str, str, str | None]] = []
 
@@ -95,6 +101,8 @@ class LoggingNotifier:
 
 class ConsoleNotifier:
     """本地调试 / --dry-run 用：只打印，不发请求。"""
+
+    delivers = False
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, str, str | None]] = []

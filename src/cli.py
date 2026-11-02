@@ -190,8 +190,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     state.record_success()
     if not args.dry_run:
-        for hit in fresh:
-            state.mark_notified(hit.key(hall_id), moment)
+        if getattr(notifier, "delivers", False):
+            for hit in fresh:
+                state.mark_notified(hit.key(hall_id), moment)
+        else:
+            # 没配 SPT / dry-run：消息没真正投递，不能记账，否则配好后会漏推
+            log.warning("本轮未真正投递，不记录已推送状态，下次仍会重试这批空场")
         state.save(state_path)
     return 0
 
