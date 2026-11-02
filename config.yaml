@@ -45,8 +45,8 @@ schedule:
     time_windows: ["19:00-22:00"]
   - weekday: 5                     # 周五
     time_windows: ["19:00-22:00"]
-    - weekday: 6                   # 周六
-    time_windows: ["14:00-22:00"]  
+  - weekday: 6                     # 周六
+    time_windows: ["14:00-22:00"]
   - weekday: 7                     # 周日
     time_windows: ["14:00-22:00"]
 

@@ -25,7 +25,14 @@ from .ehall import (
 )
 from .matcher import Hit, Slot, drop_started, select
 from .notify import ConsoleNotifier, NotifyError, build_notifier
-from .schedule import describe, describes_targets, fingerprint, parse_schedule, plan_targets
+from .schedule import (
+    cron_expression,
+    describe,
+    describes_targets,
+    fingerprint,
+    parse_schedule,
+    plan_targets,
+)
 from .state import State
 from .timeutil import DEFAULT_ACTIVE_HOURS, in_active_window, now, weekday_cn
 
@@ -40,7 +47,11 @@ def load_config(path: str | Path = DEFAULT_CONFIG) -> dict[str, Any]:
     file = Path(path)
     if not file.exists():
         raise SystemExit(f"找不到配置文件 {file}")
-    data = yaml.safe_load(file.read_text(encoding="utf-8")) or {}
+    try:
+        data = yaml.safe_load(file.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        # 缩进错/引号没闭合是最常见的低级错，给出可读信息而不是 traceback
+        raise SystemExit(f"{file} 不是合法的 YAML（多半是缩进或引号）：{exc}") from exc
     if not isinstance(data, dict):
         raise SystemExit(f"配置文件 {file} 顶层必须是映射")
     return data
@@ -397,6 +408,55 @@ def cmd_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------- check
+def cmd_check(args: argparse.Namespace) -> int:
+    """本地自检：配置能不能解析、今天会查什么、cron 是否跟扫描窗口同步。
+
+    push 之前跑一遍，缩进错、时窗写反、cron 忘改都能当场发现。
+    """
+    config_path = Path(args.config)
+    try:
+        cfg = load_config(config_path)
+    except SystemExit as exc:
+        print(f"✗ {exc}")
+        return 1
+    try:
+        rules = parse_schedule(cfg.get("schedule"))
+    except ValueError as exc:
+        print(f"✗ schedule 配置有误：{exc}")
+        return 1
+    if not rules:
+        print("✗ schedule 为空：请配置要盯的星期与时段")
+        return 1
+
+    active_hours = tuple(cfg.get("active_hours") or DEFAULT_ACTIVE_HOURS)
+    moment = _resolve_now(args.now)
+
+    print(f"✓ 配置可解析：{config_path}")
+    print(f"  盯场表：{describe(rules)}")
+    print(f"  扫描窗口：{active_hours[0]}-{active_hours[1]}（北京时间）")
+
+    targets = plan_targets(rules, moment)
+    today = f"{moment:%Y-%m-%d} 周{weekday_cn(moment.date())}"
+    print(f"  {today} 会查：{describes_targets(targets) if targets else '（本周已无目标，不会发请求）'}")
+
+    expected = cron_expression(active_hours)
+    print(f"  cron 应为：{expected}")
+
+    workflow = config_path.parent / ".github" / "workflows" / "watch.yml"
+    if workflow.exists():
+        crons = [
+            line.split('"')[1]
+            for line in workflow.read_text(encoding="utf-8").splitlines()
+            if line.strip().startswith("- cron:")
+        ]
+        if crons and crons[0] != expected:
+            print(f"✗ watch.yml 里写的是 {crons[0]}，与上面推导值不一致，请同步修改")
+            return 1
+        print("✓ watch.yml 的 cron 与扫描窗口一致")
+    return 0
+
+
 # --------------------------------------------------------------------- 工具
 def _filter_slots(slots: list[Slot], resource_ids: list[str], moment: datetime) -> list[Slot]:
     """按资源下钻 + 剔除已经开始的时段。"""
@@ -464,6 +524,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     smoke = sub.add_parser("smoke", help="连通性验证（GitHub Actions 首次部署用）")
     smoke.set_defaults(func=cmd_smoke)
+
+    check = sub.add_parser("check", help="本地自检：配置能否解析、cron 是否同步")
+    check.add_argument("--now", help="伪造当前时间（ISO8601）")
+    check.set_defaults(func=cmd_check)
     return parser
 
 

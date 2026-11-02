@@ -217,6 +217,44 @@ def test_missing_cookie_alerts_once_per_day(tmp_path, monkeypatch):
     assert len([t for t, _ in recorder.sent if "配置" in t]) == 1
 
 
+# ------------------------------------------------------------------ 本地自检
+def test_check_passes_on_valid_config(tmp_path):
+    cfg = write_config(tmp_path)
+    args = argparse.Namespace(config=str(cfg), now=f"{MONDAY}T15:00:00", verbose=False)
+    assert cli.cmd_check(args) == 0
+
+
+def test_check_detects_cron_drift(tmp_path):
+    cfg = write_config(tmp_path)
+    workflow = tmp_path / ".github" / "workflows" / "watch.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text('on:\n  schedule:\n    - cron: "*/5 0-5 * * *"\n', encoding="utf-8")
+    args = argparse.Namespace(config=str(cfg), now=f"{MONDAY}T15:00:00", verbose=False)
+    assert cli.cmd_check(args) == 1
+
+
+def test_check_reports_bad_yaml_instead_of_traceback(tmp_path, capsys):
+    """复现线上那次事故：列表项缩进多一层。"""
+    bad = tmp_path / "config.yaml"
+    bad.write_text(
+        "schedule:\n"
+        "  - weekday: 5\n"
+        "    time_windows: ['19:00-22:00']\n"
+        "    - weekday: 6\n"
+        "    time_windows: ['14:00-22:00']\n",
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(config=str(bad), now=f"{MONDAY}T15:00:00", verbose=False)
+    assert cli.cmd_check(args) == 1
+    assert "不是合法的 YAML" in capsys.readouterr().out
+
+
+def test_check_flags_empty_schedule(tmp_path):
+    cfg = write_config(tmp_path, schedule=[])
+    args = argparse.Namespace(config=str(cfg), now=f"{MONDAY}T15:00:00", verbose=False)
+    assert cli.cmd_check(args) == 1
+
+
 # ------------------------------------------------------------------ 消息渲染
 def make_hit(day, hour, name="7号场", rid="156#7号场", minutes=60):
     start = time(hour, 0)
