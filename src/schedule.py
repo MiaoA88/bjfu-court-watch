@@ -131,15 +131,59 @@ def fingerprint(rules: Iterable[Rule]) -> str:
 
 
 # --------------------------------------------------------------------- cron 推导
-def cron_expression(active_hours: tuple[str, str] = ("14:00", "22:00")) -> str:
-    """推导出与扫描窗口一致的 cron（北京时间换算成 UTC）。
+#
+# 计费口径（重要）：GitHub 按 **job** 向上取整到整分钟，所以我们每次 14–33 秒的运行
+# 都记 1 分钟。额度约束因此是"每月运行次数 ≤ 2000"，与单次跑多久基本无关。
+# 下面几个函数就是为了在改窗口/间隔前先把这笔账算清楚。
 
-    每天都触发（具体查哪天由 plan_targets 决定，不靠 cron 的星期字段）。
-    active_hours 左闭右开：14:00-22:00 覆盖 14..21 点 → UTC 6..13 点。
+FREE_MINUTES_PER_MONTH = 2000
+
+
+def runs_per_hour(interval: int) -> int:
+    """cron 的 */N 在每小时实际触发几次（N 不整除 60 时不是 60/N）。"""
+    if interval < 1:
+        raise ValueError(f"间隔必须 ≥ 1 分钟，收到 {interval}")
+    if interval > 59:
+        raise ValueError(f"间隔最大 59 分钟，收到 {interval}")
+    return len(range(0, 60, interval))
+
+
+def window_hours(active_hours: tuple[str, str] = ("09:00", "22:00")) -> int:
+    start, end = active_window(active_hours)
+    if end > start:
+        return end.hour - start.hour
+    return (24 - start.hour) + end.hour
+
+
+def daily_runs(active_hours: tuple[str, str] = ("09:00", "22:00"), interval: int = 15) -> int:
+    return runs_per_hour(interval) * window_hours(active_hours)
+
+
+def monthly_minutes(
+    active_hours: tuple[str, str] = ("09:00", "22:00"),
+    interval: int = 15,
+    *,
+    days: int = 31,
+    extra_runs: int = 0,
+) -> int:
+    """按 job 取整口径估算每月消耗的分钟数。days 默认取最长的 31 天。"""
+    return daily_runs(active_hours, interval) * days + extra_runs
+
+
+def cron_expression(
+    active_hours: tuple[str, str] = ("09:00", "22:00"),
+    interval: int = 15,
+) -> str:
+    """推导出与扫描窗口、间隔一致的 cron（北京时间换算成 UTC）。
+
+    每天都触发；具体查哪天由 plan_targets 决定，不靠 cron 的星期字段。
+    active_hours 左闭右开：09:00-22:00 覆盖 9..21 点 → UTC 1..13 点。
     """
     start, end = active_window(active_hours)
     start_utc = (start.hour - 8) % 24
     end_utc = ((end.hour - 1) % 24 - 8) % 24
     hours = f"{start_utc}-{end_utc}" if start_utc <= end_utc else "*"
-    return f"*/5 {hours} * * *"
+    runs_per_hour(interval)  # 复用校验
+    step = "*" if interval == 1 else f"*/{interval}"
+    return f"{step} {hours} * * *"
 

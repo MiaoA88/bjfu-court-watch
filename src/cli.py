@@ -26,10 +26,13 @@ from .ehall import (
 from .matcher import Hit, Slot, drop_started, select
 from .notify import ConsoleNotifier, NotifyError, build_notifier
 from .schedule import (
+    FREE_MINUTES_PER_MONTH,
     cron_expression,
+    daily_runs,
     describe,
     describes_targets,
     fingerprint,
+    monthly_minutes,
     parse_schedule,
     plan_targets,
 )
@@ -430,6 +433,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
 
     active_hours = tuple(cfg.get("active_hours") or DEFAULT_ACTIVE_HOURS)
+    interval = int(cfg.get("scan_interval_minutes", 15))
     moment = _resolve_now(args.now)
 
     print(f"✓ 配置可解析：{config_path}")
@@ -440,8 +444,20 @@ def cmd_check(args: argparse.Namespace) -> int:
     today = f"{moment:%Y-%m-%d} 周{weekday_cn(moment.date())}"
     print(f"  {today} 会查：{describes_targets(targets) if targets else '（本周已无目标，不会发请求）'}")
 
-    expected = cron_expression(active_hours)
+    expected = cron_expression(active_hours, interval)
+    per_day = daily_runs(active_hours, interval)
+    per_month = monthly_minutes(active_hours, interval)
+    print(f"  查询间隔：{interval} 分钟 → {per_day} 次/天")
+    print(f"  额度估算：约 {per_month} 分钟/月（按 31 天；GitHub 按 job 取整，每次 1 分钟）")
     print(f"  cron 应为：{expected}")
+
+    if per_month > FREE_MINUTES_PER_MONTH:
+        print(
+            f"✗ 估算 {per_month} 分钟超过免费额度 {FREE_MINUTES_PER_MONTH}，"
+            "月中会被掐断：把 scan_interval_minutes 调大"
+        )
+        return 1
+    print(f"  ✓ 额度余量 {FREE_MINUTES_PER_MONTH - per_month} 分钟")
 
     workflow = config_path.parent / ".github" / "workflows" / "watch.yml"
     if workflow.exists():

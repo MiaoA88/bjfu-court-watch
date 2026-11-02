@@ -2,11 +2,13 @@ name: court-watch
 
 on:
   schedule:
-    # Every day. Hour range must match config.yaml active_hours 14:00-22:00
-    # (Beijing): UTC 06:00-13:55 == Beijing 14:00-21:55.
-    # Which dates to query is decided in code (plan_targets), not by cron.
+    # Every day. Step and hour range must match config.yaml active_hours
+    # 09:00-22:00 (Beijing) + scan_interval_minutes 15:
+    # UTC 01:00-13:55 == Beijing 09:00-21:55.
+    # GitHub bills each job rounded up to 1 minute, so the real budget is
+    # run COUNT (<= 2000/month), not duration. */15 over 13h = 52 runs/day.
     # tests/test_workflow_consistency.py enforces this match.
-    - cron: "*/5 6-13 * * *"
+    - cron: "*/15 1-13 * * *"
   workflow_dispatch:
 
 concurrency:

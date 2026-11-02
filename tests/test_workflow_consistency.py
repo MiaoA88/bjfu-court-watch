@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from src.schedule import cron_expression, parse_schedule
+from src.schedule import FREE_MINUTES_PER_MONTH, cron_expression, monthly_minutes, parse_schedule
 from src.timeutil import DEFAULT_ACTIVE_HOURS
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,15 +28,24 @@ def trigger_block(workflow: dict) -> dict:
 def test_cron_matches_config_active_hours():
     config = load_yaml(CONFIG)
     active_hours = tuple(config.get("active_hours") or DEFAULT_ACTIVE_HOURS)
-    expected = cron_expression(active_hours)
+    interval = int(config.get("scan_interval_minutes", 15))
+    expected = cron_expression(active_hours, interval)
 
     workflow = load_yaml(WORKFLOW)
     crons = [entry["cron"] for entry in trigger_block(workflow)["schedule"]]
 
     assert crons == [expected], (
         f"watch.yml 的 cron {crons} 与 config.yaml 推导出的 {expected} 不一致；"
-        "改扫描窗口时记得同步 cron"
+        "改扫描窗口或间隔时记得同步 cron"
     )
+
+
+def test_config_stays_within_actions_quota():
+    """按 job 取整口径（每次 1 分钟）估算，不能在月中把额度烧光。"""
+    config = load_yaml(CONFIG)
+    active_hours = tuple(config.get("active_hours") or DEFAULT_ACTIVE_HOURS)
+    interval = int(config.get("scan_interval_minutes", 15))
+    assert monthly_minutes(active_hours, interval) <= FREE_MINUTES_PER_MONTH
 
 
 def test_workflow_has_manual_dispatch():

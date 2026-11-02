@@ -4,15 +4,20 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.schedule import (
+    FREE_MINUTES_PER_MONTH,
     Rule,
     Target,
     cron_expression,
+    daily_runs,
     describe,
     describes_targets,
     fingerprint,
     format_windows,
+    monthly_minutes,
     parse_schedule,
     plan_targets,
+    runs_per_hour,
+    window_hours,
 )
 
 BJ = ZoneInfo("Asia/Shanghai")
@@ -195,12 +200,43 @@ def test_fingerprint_changes_only_with_schedule():
     assert len(fingerprint(a)) == 16
 
 
-# ------------------------------------------------------------------ cron 推导
-def test_cron_expression_from_active_hours():
-    # 北京 14:00-22:00 左闭右开 → 覆盖 14..21 点 → UTC 6..13
-    assert cron_expression(("14:00", "22:00")) == "*/5 6-13 * * *"
-    assert cron_expression(("12:00", "20:00")) == "*/5 4-11 * * *"
+# ------------------------------------------------------------------ cron 与额度
+def test_cron_expression_from_window_and_interval():
+    assert cron_expression(("09:00", "22:00"), 15) == "*/15 1-13 * * *"
+    assert cron_expression(("14:00", "22:00"), 5) == "*/5 6-13 * * *"
+    assert cron_expression(("09:00", "22:00"), 1) == "* 1-13 * * *"
 
 
 def test_cron_runs_every_day():
-    assert cron_expression(("14:00", "22:00")).endswith("* * *")
+    assert cron_expression(("09:00", "22:00"), 15).endswith("* * *")
+
+
+@pytest.mark.parametrize("interval,expected", [(15, 4), (12, 5), (5, 12), (7, 9), (20, 3), (30, 2)])
+def test_runs_per_hour_handles_non_divisors(interval, expected):
+    # */7 是 0,7,...,56 共 9 次，不是 60/7≈8.6；这就是不能直接用除法的地方
+    assert runs_per_hour(interval) == expected
+
+
+def test_window_hours():
+    assert window_hours(("09:00", "22:00")) == 13
+    assert window_hours(("14:00", "22:00")) == 8
+
+
+def test_daily_and_monthly_budget():
+    # GitHub 按 job 取整到 1 分钟，所以次数就是分钟数
+    assert daily_runs(("09:00", "22:00"), 15) == 52
+    assert monthly_minutes(("09:00", "22:00"), 15) == 1612
+    assert monthly_minutes(("09:00", "22:00"), 12) == 2015  # 会超
+
+
+def test_fifteen_minutes_is_the_densest_safe_step():
+    """13 小时窗口下，*/15 是不超 2000 分钟的最密整步长。"""
+    safe = [n for n in range(1, 60) if monthly_minutes(("09:00", "22:00"), n) <= FREE_MINUTES_PER_MONTH]
+    assert min(safe) == 15
+
+
+def test_interval_is_validated():
+    with pytest.raises(ValueError):
+        runs_per_hour(0)
+    with pytest.raises(ValueError):
+        cron_expression(("09:00", "22:00"), 60)
