@@ -2,8 +2,8 @@ name: court-watch
 
 on:
   schedule:
-    # UTC 01:00-11:55 = 北京 09:00-19:55，正好覆盖系统开放时段。
-    # GitHub cron 最短 5 分钟，且高负载时可能延迟 5-20 分钟。
+    # UTC 01:00-11:55 == Beijing 09:00-19:55, covering the booking window.
+    # GitHub cron has a 5-minute floor and may be delayed by 5-20 minutes.
     - cron: "*/5 1-11 * * *"
   workflow_dispatch:
 
@@ -29,7 +29,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 去重状态跨运行传递：run_id 保证每次都能写新缓存，restore-keys 取最近一份。
+      # Dedup state survives across runs: a unique key per run keeps the cache
+      # writable, and restore-keys picks the most recent entry.
       - name: Restore state
         uses: actions/cache@v4
         with:

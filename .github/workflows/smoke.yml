@@ -1,7 +1,7 @@
 name: smoke
 
-# 首次部署用来回答一个问题：GitHub runner 能不能访问 ehall？
-# 结论写在日志末尾的"判定"行里。
+# First-deployment check: can the GitHub runner reach ehall at all?
+# The verdict is printed on the last line of the job log.
 
 on:
   workflow_dispatch:
