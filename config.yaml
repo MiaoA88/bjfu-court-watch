@@ -2,48 +2,49 @@
 # 改这个文件即可，不需要动代码。
 
 venue:
-  # 预约页 https://ehall.bjfu.edu.cn/v2/reserve/hallView?id=54 里的 id
+  # 预约页 https://ehall.bjfu.edu.cn/v2/reserve/hallView?id=54 的 id
+  # 54 = 多功能厅运动场地预约（含 羽毛球综合场馆 156 / 乒乓球 157）
   hall_id: 54
+  page_size: 20
 
-  # 余量接口。probe 跑完后按输出的"建议写入"改这两行。
-  margin_endpoint: /site/reservation/resource-info-margin
-  margin_method: GET
+  # 可用性判定。实测状态码：
+  #   1=可预约  3=已约满  4=不可预约  5=未开放  0=已过期
+  # 注意 status=5 时 margin 也返回 1，只看余量会把未来整月误报成空场。
+  available_status: 1
+
+  # 只看这些资源（156=羽毛球综合场馆，157=乒乓球综合场馆）。
+  # 54 号场馆下挂了两个运动项目，不限定会把乒乓球也算进来。
+  resource_ids: [156]
 
   # 只关注名字里含这些词的场地（留空 [] 表示全部）
+  # 例：["1号", "2号"] 只看 1、2 号塑胶场地
   resource_name_include: []
-  # 排除（例如排除"备用场"）
   resource_name_exclude: []
 
-  # 接口参数名不是 hallId/date 时，在这里改名
-  param_names: {}
-  #   hall: hallId
-  #   date: date
-  # 额外固定参数
-  extra_params: {}
-
 targets:
-  # 相对今天往后 N 天：0=今天，1=明天，2=后天
-  days_ahead: [1, 2, 3]
-  # 绝对日期，优先级与 days_ahead 取并集
+  # 相对今天往后 N 天：0=今天。实测放场窗口约 7 天（第 8 天起 status=5 未开放）
+  days_ahead: [0, 1, 2, 3, 4, 5, 6, 7]
+  # 绝对日期，与 days_ahead 取并集
   dates: []
-  # 想盯的时段（北京时间），接口时段粒度更细时按"有交集"判断
+  # 想盯的时段（北京时间）。接口时段粒度是 1 小时，按"有交集"判断
   time_windows:
     - "18:00-19:00"
     - "19:00-20:00"
+    - "20:00-21:00"
 
 matching:
   # 至少连续几段才算命中；1 = 任一时段有空就推
   min_consecutive_slots: 1
 
-# 查询窗口（北京时间，左闭右开）。
-# 系统 20:00-次日 09:00 关闭，此时段不查询、不推送。
+# 扫描窗口（北京时间，左闭右开）。
+# 注意这是"我要盯的时间"，不是系统开关时间：系统 09:00-23:00 开放预约，
+# 23:00 后场地全部显示不可预约但网页仍可访问。
 active_hours: ["09:00", "20:00"]
 
 notify:
   provider: wxpusher_spt
   # 同一空场（日期+时段+场地）整个生命周期内最多推几次
   max_alerts_per_slot: 1
-  # 推送里"打开预约页"的链接
   detail_url: "https://ehall.bjfu.edu.cn/v2/reserve/hallView?id=54"
 
 http:
@@ -52,13 +53,3 @@ http:
 
 state:
   path: .state/notified.json
-
-# 响应字段映射。probe 后若 slots=0，改这里而不是改代码。
-fields:
-  start: [startTime, beginTime, start, startStr, timeStart, begin, startDate, fromTime]
-  end: [endTime, finish, end, endStr, timeEnd, toTime]
-  remaining: [surplus, remain, remaining, leftNum, left, available, stock, canReserve, isFree]
-  capacity: [capacity, total, totalNum, maxNum]
-  resource_name: [resourceName, name, hallName, resourceTitle, title, placeName]
-  resource_id: [resourceId, resourceCode, id, code]
-  date: [date, reserveDate, day, useDate, bizDate, timeDate]

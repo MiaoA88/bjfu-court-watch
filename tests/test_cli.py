@@ -1,9 +1,11 @@
 import argparse
+from datetime import date, time
 
 import pytest
 import yaml
 
 from src import cli
+from src.matcher import Hit, Slot
 
 
 class Recorder:
@@ -18,7 +20,7 @@ class Recorder:
 
 def write_config(tmp_path, **overrides):
     cfg = {
-        "venue": {"hall_id": 54},
+        "venue": {"hall_id": 54, "resource_ids": [156]},
         "targets": {"days_ahead": [1], "time_windows": ["18:00-19:00"]},
         "active_hours": ["09:00", "20:00"],
         "notify": {"provider": "wxpusher_spt"},
@@ -36,10 +38,26 @@ def make_args(config, now, dry_run=False):
     )
 
 
+def make_hit(day, hour, name="7号场", rid="156#7号场", minutes=60):
+    start = time(hour, 0)
+    end = time((hour + minutes // 60) % 24, 0)
+    slot = Slot(
+        date=day,
+        start=start,
+        end=end,
+        resource_id=rid,
+        resource_name=name,
+        remaining=1,
+        status=1,
+    )
+    return Hit(date=day, start=start, end=end, resource_id=rid, resource_name=name, slots=(slot,))
+
+
+# ------------------------------------------------------------------ 窗口闸门
 def test_outside_window_skips_without_touching_anything(tmp_path, monkeypatch):
     monkeypatch.delenv("EHALL_COOKIE", raising=False)
     cfg = write_config(tmp_path)
-    # 21:00 已过 20:00 关门时间
+    # 21:00 已过扫描窗口 20:00
     assert cli.cmd_watch(make_args(cfg, "2026-11-02T21:00:00")) == 0
     assert not (tmp_path / "state.json").exists(), "窗口外不应写状态"
 
@@ -70,47 +88,51 @@ def test_empty_time_windows_is_fatal(tmp_path):
 
 
 def test_empty_targets_is_fatal(tmp_path):
-    cfg = write_config(tmp_path, targets={"days_ahead": [], "dates": [], "time_windows": ["18:00-19:00"]})
+    cfg = write_config(
+        tmp_path, targets={"days_ahead": [], "dates": [], "time_windows": ["18:00-19:00"]}
+    )
     with pytest.raises(SystemExit):
         cli.cmd_watch(make_args(cfg, "2026-11-02T10:00:00"))
 
 
-def test_render_message_groups_by_day_and_caps_lines():
-    from datetime import date, time
+# ------------------------------------------------------------------ 消息渲染
+def test_render_merges_courts_of_same_span():
+    day = date(2026, 11, 5)
+    hits = [make_hit(day, 18, name="1号场", rid="156#1"), make_hit(day, 18, name="2号场", rid="156#2")]
+    title, body = cli.render_message(hits, 54, cli.now(), None)
 
-    from src.matcher import Hit, Slot
-
-    def hit(day, hour, rid="7", name="7号场", remaining=1):
-        slot = Slot(
-            date=day,
-            start=time(hour, 0),
-            end=time(hour + 1, 0),
-            resource_id=rid,
-            resource_name=name,
-            remaining=remaining,
-        )
-        return Hit(
-            date=day,
-            start=slot.start,
-            end=slot.end,
-            resource_id=rid,
-            resource_name=name,
-            slots=(slot,),
-        )
-
-    moment = cli.now()
-    title, body = cli.render_message([hit(date(2026, 11, 5), 18), hit(date(2026, 11, 5), 19)], 54, moment, None)
-    assert "2 处空场" in title
-    assert "11-05" in body and "18:00-19:00" in body
+    assert "1 个时段有空场" in title
+    assert "11-05" in body
+    assert "18:00-19:00 · 2 块（1号场、2号场）" in body
     assert "场馆 54" in body
 
-    many = [hit(date(2026, 11, 5), h % 23, rid=str(h)) for h in range(50)]
-    _, capped = cli.render_message(many, 54, moment, None, max_lines=10)
-    assert "另有 40 处未列出" in capped
+
+def test_render_sorts_courts_numerically():
+    day = date(2026, 11, 5)
+    hits = [
+        make_hit(day, 18, name="10号场", rid="156#10"),
+        make_hit(day, 18, name="2号场", rid="156#2"),
+    ]
+    _, body = cli.render_message(hits, 54, cli.now(), None)
+    assert "2 号场、10号场" not in body  # 断言排序：2 在 10 前
+    assert "2号场、10号场" in body
 
 
-def test_render_message_without_detail_url_is_fine():
-    moment = cli.now()
-    title, body = cli.render_message([], 54, moment, None)
-    assert "无空场" in title
+def test_render_caps_items_and_reports_remainder():
+    day = date(2026, 11, 5)
+    hits = [make_hit(day, hour, name=f"{hour}号场", rid=f"156#{hour}") for hour in range(12)]
+    title, body = cli.render_message(hits, 54, cli.now(), None, max_items=5)
+
+    assert "12 个时段有空场" in title
+    assert "另有 7 个时段未列出" in body
+
+
+def test_render_empty_hits():
+    title, body = cli.render_message([], 54, cli.now(), None)
+    assert "暂无空场" in title
     assert "场馆 54" in body
+
+
+def test_court_key_sorts_by_leading_number():
+    names = ["10号场", "2号场", "1号场", "未知场地"]
+    assert sorted(names, key=cli._court_key) == ["1号场", "2号场", "10号场", "未知场地"]

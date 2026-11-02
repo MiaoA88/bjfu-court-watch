@@ -6,14 +6,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 from .timeutil import parse_hhmm
 
 
 @dataclass(frozen=True)
 class Slot:
-    """一个"某场地某日某时段"的可预约单元。"""
+    """一个"某场地某日某时段"的可预约单元。
+
+    status 是学校的原始状态码：只有 status==available_status（默认 1）才是真的能约。
+    仅看 remaining 会把 status=5「未开放」的格子误判成空场——那时 margin 也返回 1。
+    """
 
     date: date
     start: time
@@ -22,6 +26,16 @@ class Slot:
     resource_name: str
     remaining: int
     capacity: int | None = None
+    status: int | None = None
+    available_status: int = 1
+
+    @property
+    def available(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        if self.status is None:  # 无状态码的来源（如测试/其他接口）退化为只看余量
+            return True
+        return self.status == self.available_status
 
     @property
     def minutes(self) -> int:
@@ -91,6 +105,20 @@ def parse_windows(values) -> list[tuple[time, time]]:
     return windows
 
 
+def drop_started(slots: list[Slot], moment: datetime) -> list[Slot]:
+    """剔除已经开始的时段。
+
+    今天的 19:00-20:00 场在 19:20 已经无法预约，但学校接口仍可能返回 status=1。
+    必须在合并连续区间之前过滤，否则会连带丢掉后面还能约的整段。
+    """
+    kept: list[Slot] = []
+    for slot in slots:
+        start = datetime.combine(slot.date, slot.start, moment.tzinfo)
+        if start > moment:
+            kept.append(slot)
+    return kept
+
+
 def select(
     slots: list[Slot],
     *,
@@ -115,7 +143,7 @@ def select(
 
     buckets: dict[tuple[date, str], list[Slot]] = {}
     for slot in slots:
-        if slot.date not in wanted or slot.remaining <= 0:
+        if slot.date not in wanted or not slot.available:
             continue
         if not any(slot.overlaps(w) for w in windows):
             continue

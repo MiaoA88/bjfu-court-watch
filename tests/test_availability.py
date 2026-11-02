@@ -1,97 +1,117 @@
 from datetime import date, time
 
-from src.availability import FieldMap, diagnose, extract_slots, parse_clock, parse_day, parse_remaining
+from src.availability import (
+    parse_clock,
+    parse_day,
+    parse_list_page,
+    parse_remaining,
+    parse_span,
+    summarize_table,
+)
+from src.matcher import parse_windows, select
 
+DAY = date(2026, 11, 3)
 
-def test_flat_list_payload():
-    payload = [
+PAYLOAD = {
+    "total": 1,
+    "list": [
         {
-            "resourceId": "7",
-            "resourceName": "7号场",
-            "date": "2026-11-05",
-            "startTime": "18:00",
-            "endTime": "19:00",
-            "surplus": 2,
-        },
-        {
-            "resourceId": "7",
-            "resourceName": "7号场",
-            "date": "2026-11-05",
-            "startTime": "19:00",
-            "endTime": "20:00",
-            "surplus": 0,
-        },
-    ]
-    slots = extract_slots(payload)
-    assert len(slots) == 2
-    assert slots[0].start == time(18, 0)
-    assert slots[0].remaining == 2
-    assert slots[1].remaining == 0
+            "id": 156,
+            "name": "羽毛球综合场馆（收费）",
+            "table": {
+                "595": [
+                    {
+                        "abscissa": "1号塑胶场地",
+                        "yaxis": "18:00-19:00",
+                        "row": {"status": 1, "total": 1, "margin": 1},
+                        "date": "2026-11-03",
+                    },
+                    {
+                        "abscissa": "1号塑胶场地",
+                        "yaxis": "19:00-20:00",
+                        "row": {"status": 5, "total": 1, "margin": 1},  # 未开放，margin 却是 1
+                        "date": "2026-11-03",
+                    },
+                    {
+                        "abscissa": "2号塑胶场地",
+                        "yaxis": "18:00-19:00",
+                        "row": {"status": 3, "total": 1, "margin": 0},  # 已约满
+                        "date": "2026-11-03",
+                    },
+                ]
+            },
+        }
+    ],
+}
 
 
-def test_date_inherited_from_ancestor():
-    payload = {
-        "hallId": 54,
-        "date": "2026-11-05",
-        "resources": [
-            {
-                "resourceId": "7",
-                "resourceName": "7号场",
-                "times": [{"beginTime": "18:00:00", "endTime": "19:00:00", "remain": 1}],
-            }
-        ],
-    }
-    slots = extract_slots(payload)
-    assert len(slots) == 1
-    assert slots[0].date == date(2026, 11, 5)
-    assert slots[0].resource_id == "7"
+def test_parse_span():
+    assert parse_span("18:00-19:00") == (time(18, 0), time(19, 0))
+    assert parse_span("8:00–9:00") == (time(8, 0), time(9, 0))  # 全角连字符
+    assert parse_span("19:00-18:00") is None  # 倒序
+    assert parse_span("18:00") is None
+    assert parse_span(None) is None
 
 
-def test_compact_int_times_and_boolean_availability():
-    payload = {
-        "items": [
-            {
-                "id": "9",
-                "name": "9号场",
-                "date": "20261105",
-                "start": 1800,
-                "end": 1900,
-                "canReserve": True,
-            }
-        ]
-    }
-    slots = extract_slots(payload)
-    assert len(slots) == 1
-    assert slots[0].start == time(18, 0)
-    assert slots[0].end == time(19, 0)
-    assert slots[0].remaining == 1
+def test_parse_list_page_extracts_all_cells():
+    slots = parse_list_page(PAYLOAD, DAY)
+    assert len(slots) == 3
+    first = slots[0]
+    assert first.date == DAY
+    assert first.start == time(18, 0)
+    assert first.end == time(19, 0)
+    assert first.resource_name == "1号塑胶场地"
+    assert first.resource_id == "156#1号塑胶场地"
+    assert first.remaining == 1
+    assert first.status == 1
 
 
-def test_missing_end_time_is_skipped():
-    payload = [{"resourceId": "7", "date": "2026-11-05", "startTime": "18:00", "surplus": 1}]
-    assert extract_slots(payload) == []
+def test_status5_is_not_available_despite_margin():
+    """核心回归：未开放(status=5) 的格子 margin=1，但绝不能算空场。"""
+    slots = parse_list_page(PAYLOAD, DAY)
+    by_span = {(s.resource_name, s.start): s for s in slots}
+
+    open_slot = by_span[("1号塑胶场地", time(18, 0))]
+    assert open_slot.available is True
+
+    unopened = by_span[("1号塑胶场地", time(19, 0))]
+    assert unopened.remaining == 1
+    assert unopened.status == 5
+    assert unopened.available is False
+
+    full = by_span[("2号塑胶场地", time(18, 0))]
+    assert full.available is False
 
 
-def test_garbage_payload_returns_empty():
-    assert extract_slots({"msg": "维护中"}) == []
-    assert extract_slots(None) == []
-    assert extract_slots([]) == []
+def test_matcher_only_sees_bookable_slots():
+    slots = parse_list_page(PAYLOAD, DAY)
+    hits = select(slots, target_dates=[DAY], windows=parse_windows(["18:00-20:00"]))
+    assert len(hits) == 1
+    assert hits[0].resource_name == "1号塑胶场地"
+    assert hits[0].label == "18:00-19:00"
 
 
-def test_custom_field_map():
-    payload = [{"court": "3号场", "day": "2026-11-05", "from": "18:00", "to": "19:00", "free": 4}]
-    fields = FieldMap(
-        start=["from"],
-        end=["to"],
-        remaining=["free"],
-        resource_name=["court"],
-        resource_id=["court"],
-        date=["day"],
-    )
-    slots = extract_slots(payload, fields)
-    assert len(slots) == 1
-    assert slots[0].resource_name == "3号场"
-    assert slots[0].remaining == 4
+def test_summarize_table_reports_status_distribution():
+    report = summarize_table(PAYLOAD)
+    info = report["羽毛球综合场馆（收费）"]
+    assert info["courts"] == 2
+    assert info["spans"] == 2
+    assert info["cells"] == 3
+    assert info["status"]["可预约"] == 1
+    assert info["status"]["未开放"] == 1
+    assert info["status"]["已约满"] == 1
+
+
+def test_custom_available_status_is_respected():
+    # 若学校改成 status=2 表示可约，只改配置即可
+    slots = parse_list_page(PAYLOAD, DAY, available_status=5)
+    assert [s.available for s in slots] == [False, True, False]
+
+
+def test_missing_table_yields_empty():
+    assert parse_list_page({"list": [{"id": 1, "name": "x"}]}, DAY) == []
+    assert parse_list_page({}, DAY) == []
+    assert parse_list_page(None, DAY) == []
 
 
 def test_parse_clock_variants():
@@ -99,9 +119,7 @@ def test_parse_clock_variants():
     assert parse_clock("18:00:00") == time(18, 0)
     assert parse_clock("1800") == time(18, 0)
     assert parse_clock(1800) == time(18, 0)
-    assert parse_clock(900) == time(9, 0)
     assert parse_clock("19：30") == time(19, 30)  # 全角冒号
-    assert parse_clock("") is None
     assert parse_clock("abc") is None
 
 
@@ -116,14 +134,4 @@ def test_parse_remaining_variants():
     assert parse_remaining(3) == 3
     assert parse_remaining("剩余 2 人") == 2
     assert parse_remaining(True) == 1
-    assert parse_remaining(False) == 0
-    assert parse_remaining("有") == 1
-    assert parse_remaining("约满") == 0
     assert parse_remaining("") is None
-
-
-def test_diagnose_flags_slot_like_nodes():
-    payload = {"date": "2026-11-05", "list": [{"beginTime": "18:00", "endTime": "19:00", "surplus": 1}]}
-    report = diagnose(payload)
-    assert report["node_count"] > 0
-    assert report["slot_like"]

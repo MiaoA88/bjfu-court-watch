@@ -1,6 +1,7 @@
-from datetime import date, time
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
-from src.matcher import Hit, Slot, parse_windows, select
+from src.matcher import Hit, Slot, drop_started, parse_windows, select
 
 DAY = date(2026, 11, 5)
 
@@ -106,3 +107,37 @@ def test_hit_key_is_stable_and_hall_scoped():
     assert hit.key(54) == "54|2026-11-05|18:00|19:00|7"
     assert hit.key("54") == hit.key(54)
     assert hit.min_remaining == 1
+
+
+def test_status_five_is_not_available():
+    """学校接口在"未开放"时也返回 margin=1，必须靠 status 拦住。"""
+    unopened = Slot(
+        date=DAY,
+        start=time(18, 0),
+        end=time(19, 0),
+        resource_id="7",
+        resource_name="7号场",
+        remaining=1,
+        status=5,
+    )
+    assert unopened.available is False
+    assert select([unopened], target_dates=[DAY], windows=parse_windows(["18:00-19:00"])) == []
+
+
+def test_slot_without_status_falls_back_to_remaining():
+    no_status = Slot(
+        date=DAY, start=time(18, 0), end=time(19, 0), resource_id="7", resource_name="7号场", remaining=2
+    )
+    assert no_status.available is True
+
+
+def test_drop_started_removes_only_past_spans():
+    moment = datetime(2026, 11, 5, 19, 20, tzinfo=ZoneInfo("Asia/Shanghai"))
+    slots = [
+        slot("18:00", "19:00"),  # 今天，已开始
+        slot("19:30", "20:30"),  # 今天，未开始
+        slot("18:00", "19:00", day=date(2026, 11, 6)),  # 明天
+    ]
+    kept = drop_started(slots, moment)
+    assert [s.start for s in kept] == [time(19, 30), time(18, 0)]
+    assert kept[1].date == date(2026, 11, 6)

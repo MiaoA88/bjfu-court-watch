@@ -7,13 +7,13 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from .availability import FieldMap, diagnose, fetch_resources, fetch_slots, probe
+from .availability import AVAILABLE_STATUS, fetch_resources, fetch_slots, probe
 from .ehall import (
     BASE_URL,
     ApiError,
@@ -23,7 +23,7 @@ from .ehall import (
     SchemaChanged,
     TransportError,
 )
-from .matcher import Hit, parse_windows, select
+from .matcher import Hit, drop_started, parse_windows, select
 from .notify import ConsoleNotifier, NotifyError, build_notifier
 from .state import State
 from .timeutil import DEFAULT_ACTIVE_HOURS, in_active_window, now, resolve_dates, weekday_cn
@@ -89,7 +89,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
     targets = cfg.get("targets") or {}
     matching = cfg.get("matching") or {}
     notify_cfg = cfg.get("notify") or {}
-    fields = FieldMap.from_config(cfg.get("fields"))
 
     days = resolve_dates(targets.get("days_ahead") or [], targets.get("dates") or [], moment.date())
     windows = parse_windows(targets.get("time_windows") or [])
@@ -117,8 +116,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         message = str(exc)
         return _handle_error(state, state_path, notifier, moment, RuntimeError(message), kind="config")
 
-    # 资源列表只用于日志与兜底，失败不致命
-    # 资源列表只用于日志与兜底，失败不致命
+    # 资源列表只用于日志，失败不致命
     if not state.resources.get(str(hall_id)):
         resources = fetch_resources(client, hall_id)
         if resources:
@@ -126,25 +124,22 @@ def cmd_watch(args: argparse.Namespace) -> int:
             log.info("场馆 %s 下发现 %d 个资源：%s", hall_id, len(resources),
                      "、".join(r["name"] for r in resources[:8]))
 
-    endpoint = venue.get("margin_endpoint", "/site/reservation/resource-info-margin")
-    method = venue.get("margin_method", "GET")
+    available_status = int(venue.get("available_status", AVAILABLE_STATUS))
+    page_size = int(venue.get("page_size", 20))
 
     try:
         slots = []
-        for day in days:
+        for index, day in enumerate(days):
             slots.extend(
                 fetch_slots(
                     client,
-                    endpoint=endpoint,
-                    method=method,
                     hall_id=hall_id,
                     day=day,
-                    fields=fields,
-                    extra_params=venue.get("extra_params") or {},
-                    param_names=venue.get("param_names") or {},
+                    page_size=page_size,
+                    available_status=available_status,
                 )
             )
-            if args.sleep_between:
+            if args.sleep_between and index < len(days) - 1:
                 _sleep(args.sleep_between)
     except AuthExpired as exc:
         return _handle_error(state, state_path, notifier, moment, exc, kind="auth")
@@ -152,6 +147,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
         return _handle_error(state, state_path, notifier, moment, exc, kind="other")
 
     log.info("共取到 %d 个时段，目标日期 %s", len(slots), ", ".join(d.isoformat() for d in days))
+
+    # 一个场馆下可能挂着多个资源（54 = 羽毛球 156 + 乒乓球 157），按资源 id 收窄
+    resource_ids = [str(x) for x in (venue.get("resource_ids") or [])]
+    if resource_ids:
+        before = len(slots)
+        slots = [s for s in slots if s.resource_id.split("#", 1)[0] in resource_ids]
+        log.info("资源过滤 %s：%d → %d 格", resource_ids, before, len(slots))
+
+    before = len(slots)
+    slots = drop_started(slots, moment)
+    if before != len(slots):
+        log.info("剔除已开始的时段：%d → %d 格", before, len(slots))
 
     hits = select(
         slots,
@@ -254,38 +261,53 @@ def render_message(
     moment: datetime,
     detail_url: str | None,
     *,
-    max_lines: int = 40,
+    max_items: int = 30,
 ) -> tuple[str, str]:
-    grouped: dict[str, list[Hit]] = {}
-    for hit in hits:
-        grouped.setdefault(hit.date.isoformat(), []).append(hit)
+    """按「日期 → 时段」聚合，用场地数代替逐条罗列，避免一条消息几十行。"""
+    if not hits:
+        body = f"目标时段暂无可约场地。\n\n_查询时间 {moment.strftime('%m-%d %H:%M')} · 场馆 {hall_id}_"
+        return "🏸 暂无空场", body
 
-    lines = [f"### 🏸 发现 {len(hits)} 处空场", ""]
+    by_day: dict[date, dict[tuple, list[str]]] = {}
+    for hit in hits:
+        by_day.setdefault(hit.date, {}).setdefault((hit.start, hit.end), []).append(hit.resource_name)
+
+    total_spans = sum(len(spans) for spans in by_day.values())
+    lines = [f"### 🏸 {len(by_day)} 天共 {total_spans} 个时段有空场", ""]
+
     shown = 0
-    for day_key in sorted(grouped):
-        day = grouped[day_key][0].date
+    for day in sorted(by_day):
         lines.append(f"**{day.strftime('%m-%d')} 周{weekday_cn(day)}**")
-        for hit in grouped[day_key]:
-            if shown >= max_lines:
+        for (start, end), names in sorted(by_day[day].items()):
+            if shown >= max_items:
                 break
-            lines.append(f"- {hit.label} · {hit.resource_name}（余 {hit.min_remaining}）")
+            ordered = sorted(names, key=_court_key)
+            preview = "、".join(ordered[:4]) + ("…" if len(ordered) > 4 else "")
+            lines.append(f"- {start.strftime('%H:%M')}-{end.strftime('%H:%M')} · {len(ordered)} 块（{preview}）")
             shown += 1
         lines.append("")
-    if len(hits) > shown:
-        lines.append(f"…另有 {len(hits) - shown} 处未列出")
+
+    if total_spans > shown:
+        lines.append(f"…另有 {total_spans - shown} 个时段未列出")
         lines.append("")
 
     lines.append(f"_查询时间 {moment.strftime('%m-%d %H:%M')} · 场馆 {hall_id}_")
     body = "\n".join(lines).strip()
 
-    if not hits:
-        return "🏸 今日无空场", body
-
-    first = hits[0]
-    title = f"🏸 {first.date.strftime('%m-%d')} {first.label} 有空场"
-    if len(hits) > 1:
-        title = f"🏸 {len(hits)} 处空场（{first.date.strftime('%m-%d')} {first.label} 起）"
+    first_day = min(by_day)
+    title = f"🏸 {first_day.strftime('%m-%d')} 起 {total_spans} 个时段有空场"
     return title[:100], body
+
+
+def _court_key(name: str) -> tuple[int, str]:
+    """让 1号、2号、10号 按数字排，而不是字典序。"""
+    digits = ""
+    for char in name:
+        if char.isdigit():
+            digits += char
+        else:
+            break
+    return (int(digits) if digits else 9999, name)
 
 
 # --------------------------------------------------------------------- probe
@@ -297,21 +319,16 @@ def cmd_probe(args: argparse.Namespace) -> int:
     if client is None:
         print("！未提供 EHALL_COOKIE，仅做未登录探测（验证网络与 WAF）\n")
     else:
-        print(f"已装载 Cookie（长度 {len(_env('EHALL_COOKIE') or '')}），开始探测端点\n")
+        print(f"已装载 Cookie（长度 {len(_env('EHALL_COOKIE') or '')}），逐日拉取 list-page\n")
 
-    day = datetime.fromisoformat(args.date).date() if args.date else None
-    summary = probe(client, hall_id, out_dir=args.out, day=day, sleep_between=args.sleep)
+    results = probe(client, hall_id, out_dir=args.out, days=args.days, sleep_between=args.sleep)
 
-    ok = [r for r in summary if not r.get("error") and r.get("slots")]
-    print(f"\n共探测 {len(summary)} 次，其中 {len(ok)} 次抽到了时段。")
-    if ok:
-        best = max(ok, key=lambda r: r["slots"])
-        print(
-            "建议写入 config.yaml：\n"
-            f"  venue.margin_endpoint: {best['path']}\n"
-            f"  venue.margin_method: {best['method']}\n"
-            f"  # 抽到 {best['slots']} 个时段，参数 {json.dumps(best['params'], ensure_ascii=False)}"
-        )
+    usable = [r for r in results if r.get("available")]
+    print(f"\n共探测 {len(results)} 天，其中 {len(usable)} 天存在可约格子。")
+    if usable:
+        print("\n可约概况：")
+        for record in usable:
+            print(f"  {record['date']}  可约 {record['available']} 格")
     return 0
 
 
@@ -389,11 +406,11 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--sleep-between", type=float, default=1.0, help="多日期查询之间的间隔秒数")
     watch.set_defaults(func=cmd_watch)
 
-    probe_cmd = sub.add_parser("probe", help="探测候选接口，定型字段映射")
+    probe_cmd = sub.add_parser("probe", help="逐日拉取余量，检查接口是否可用")
     probe_cmd.add_argument("--hall", help="场馆 id，默认取 config 里的 hall_id")
-    probe_cmd.add_argument("--date", help="探测用日期 YYYY-MM-DD")
-    probe_cmd.add_argument("--out", default="probe-out", help="响应落盘目录")
-    probe_cmd.add_argument("--sleep", type=float, default=0.6, help="每次探测之间的间隔")
+    probe_cmd.add_argument("--days", type=int, default=8, help="从今天起连续查几天")
+    probe_cmd.add_argument("--out", default="probe-out", help="原始响应落盘目录")
+    probe_cmd.add_argument("--sleep", type=float, default=0.6, help="每次请求之间的间隔")
     probe_cmd.add_argument("--anonymous", action="store_true", help="不带 Cookie，只验证网络")
     probe_cmd.set_defaults(func=cmd_probe)
 
