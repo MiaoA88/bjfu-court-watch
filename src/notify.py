@@ -75,6 +75,7 @@ class WxPusherSpt:
         code = result.get("code")
         if code != SUCCESS_CODE:
             raise NotifyError(f"推送被拒绝：code={code} msg={result.get('msg')!r}")
+        log.info("已推送：%s（WxPusher code=%s）", title, code)
 
 
 class LoggingNotifier:
