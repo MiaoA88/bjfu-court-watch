@@ -77,6 +77,21 @@ class WxPusherSpt:
             raise NotifyError(f"推送被拒绝：code={code} msg={result.get('msg')!r}")
 
 
+class LoggingNotifier:
+    """没配 SPT 时的降级通道：只写日志。
+
+    单独存在是为了避免"忘了配 Secret"导致每天 132 次任务失败、132 封失败邮件。
+    日志里仍然能看到本轮命中了什么，配好 SPT 后自动转为真实推送。
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str, str | None]] = []
+
+    def send(self, title: str, markdown: str, url: str | None = None) -> None:
+        self.sent.append((title, markdown, url))
+        log.warning("[未推送·缺 WXPUSHER_SPT] %s\n%s", title, markdown)
+
+
 class ConsoleNotifier:
     """本地调试 / --dry-run 用：只打印，不发请求。"""
 
@@ -98,6 +113,8 @@ def build_notifier(provider: str, spt: str | None = None, *, dry_run: bool = Fal
     if dry_run:
         return ConsoleNotifier()
     name = (provider or "wxpusher_spt").strip().lower()
-    if name in {"wxpusher_spt", "wxpusher", "spt"}:
-        return WxPusherSpt(spt or "")
-    raise NotifyError(f"未知的推送通道：{provider!r}（当前仅支持 wxpusher_spt）")
+    if name not in {"wxpusher_spt", "wxpusher", "spt"}:
+        raise NotifyError(f"未知的推送通道：{provider!r}（当前仅支持 wxpusher_spt）")
+    if not spt:
+        return LoggingNotifier()
+    return WxPusherSpt(spt)

@@ -6,6 +6,7 @@ from src.notify import (
     MAX_CONTENT_CHARS,
     SPT_ENDPOINT,
     ConsoleNotifier,
+    LoggingNotifier,
     NotifyError,
     WxPusherSpt,
     build_notifier,
@@ -77,6 +78,20 @@ def test_build_notifier_chooses_channels():
     assert isinstance(build_notifier("wxpusher_spt", "SPT_x"), WxPusherSpt)
     with pytest.raises(NotifyError):
         build_notifier("telegram", "x")
+
+
+def test_missing_spt_degrades_to_logging_instead_of_failing():
+    """没配 SPT 时不应该让任务每 5 分钟失败一次。"""
+    notifier = build_notifier("wxpusher_spt", None)
+    assert isinstance(notifier, LoggingNotifier)
+    notifier.send("标题", "正文")
+    assert len(notifier.sent) == 1
+
+
+def test_logging_notifier_records_without_network():
+    sink = LoggingNotifier()
+    sink.send("t", "body", "https://x")
+    assert sink.sent == [("t", "body", "https://x")]
 
 
 def test_console_notifier_records_messages():
