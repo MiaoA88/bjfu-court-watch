@@ -130,7 +130,7 @@ src/matcher.py       时段匹配、连续区间合并
 src/state.py         跨运行去重状态
 src/notify.py        WxPusher SPT 推送
 src/timeutil.py      北京时间、查询窗口、目标日期
-tests/               57 个测试，不依赖网络
+tests/               65 个测试，不依赖网络
 _probe/              上一轮抓取的前端资产与接口字典（溯源用，不参与运行）
 ```
 

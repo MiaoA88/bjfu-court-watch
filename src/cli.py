@@ -102,13 +102,22 @@ def cmd_watch(args: argparse.Namespace) -> int:
     state = State.load(state_path)
     state.prune(moment.date())
 
-    client = build_client(cfg)
     notifier = build_notifier(
         notify_cfg.get("provider", "wxpusher_spt"),
         _env("WXPUSHER_SPT"),
         dry_run=args.dry_run,
     )
 
+    try:
+        client = build_client(cfg)
+    except SystemExit as exc:
+        # 少配一个 Secret 不该让任务每 5 分钟失败一次（一天 144 封失败邮件）
+        if isinstance(notifier, ConsoleNotifier):
+            raise
+        message = str(exc)
+        return _handle_error(state, state_path, notifier, moment, RuntimeError(message), kind="config")
+
+    # 资源列表只用于日志与兜底，失败不致命
     # 资源列表只用于日志与兜底，失败不致命
     if not state.resources.get(str(hall_id)):
         resources = fetch_resources(client, hall_id)
@@ -191,23 +200,34 @@ def _handle_error(
 ) -> int:
     log.error("%s：%s", type(exc).__name__, exc)
 
-    if kind == "auth":
+    if kind in {"auth", "config"}:
         today = moment.date().isoformat()
-        if state.auth_alert_on != today:
-            try:
-                notifier.send(
-                    "⚠️ ehall 登录态失效",
+        if state.auth_alert_on != today:  # 每天最多打扰一次
+            if kind == "auth":
+                title = "⚠️ ehall 登录态失效"
+                body = (
                     "预约系统 Cookie 已过期，监控已暂停。\n\n"
                     "**恢复步骤**\n"
                     "1. 浏览器打开预约页并登录\n"
                     "2. F12 → Network → 任一 `site/reservation` 请求 → 复制 Cookie\n"
                     "3. 更新 GitHub Secret `EHALL_COOKIE`（UA 变了同时更新 `EHALL_UA`）\n\n"
-                    f"失效时间：{moment.strftime('%Y-%m-%d %H:%M')}",
-                    None,
+                    f"失效时间：{moment.strftime('%Y-%m-%d %H:%M')}"
                 )
+            else:
+                title = "⚠️ 监控缺少配置"
+                body = (
+                    "缺少环境变量 `EHALL_COOKIE`，监控没有启动。\n\n"
+                    "**修复**\n"
+                    "仓库 Settings → Secrets and variables → Actions → 添加：\n"
+                    "- `EHALL_COOKIE`：浏览器 Cookie\n"
+                    "- `EHALL_UA`：同一浏览器的 User-Agent\n\n"
+                    f"时间：{moment.strftime('%Y-%m-%d %H:%M')}"
+                )
+            try:
+                notifier.send(title, body, None)
                 state.auth_alert_on = today
             except NotifyError as notify_exc:
-                log.error("登录态告警推送失败：%s", notify_exc)
+                log.error("告警推送失败：%s", notify_exc)
     else:
         count = state.record_failure()
         if count == FAILURE_ALERT_THRESHOLD:
@@ -257,6 +277,9 @@ def render_message(
 
     lines.append(f"_查询时间 {moment.strftime('%m-%d %H:%M')} · 场馆 {hall_id}_")
     body = "\n".join(lines).strip()
+
+    if not hits:
+        return "🏸 今日无空场", body
 
     first = hits[0]
     title = f"🏸 {first.date.strftime('%m-%d')} {first.label} 有空场"
