@@ -2,9 +2,10 @@ name: court-watch
 
 on:
   schedule:
-    # UTC 01:00-11:55 == Beijing 09:00-19:55, covering the booking window.
-    # GitHub cron has a 5-minute floor and may be delayed by 5-20 minutes.
-    - cron: "*/5 1-11 * * *"
+    # Keep in sync with config.yaml: active_hours 12:00-20:00 (Beijing) and the
+    # schedule weekdays. UTC 04:00-11:55 == Beijing 12:00-19:55.
+    # tests/test_workflow_consistency.py enforces this match.
+    - cron: "*/5 4-11 * * 1,6"
   workflow_dispatch:
 
 concurrency:

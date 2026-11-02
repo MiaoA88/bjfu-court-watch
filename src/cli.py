@@ -23,10 +23,11 @@ from .ehall import (
     SchemaChanged,
     TransportError,
 )
-from .matcher import Hit, drop_started, parse_windows, select
+from .matcher import Hit, drop_started, select
 from .notify import ConsoleNotifier, NotifyError, build_notifier
+from .schedule import describe, merged_windows, parse_schedule, rules_for_day, weekday_label
 from .state import State
-from .timeutil import DEFAULT_ACTIVE_HOURS, in_active_window, now, resolve_dates, weekday_cn
+from .timeutil import DEFAULT_ACTIVE_HOURS, in_active_window, now, weekday_cn
 
 log = logging.getLogger("court")
 
@@ -86,16 +87,29 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     venue = cfg.get("venue") or {}
     hall_id = venue.get("hall_id", 54)
-    targets = cfg.get("targets") or {}
     matching = cfg.get("matching") or {}
     notify_cfg = cfg.get("notify") or {}
 
-    days = resolve_dates(targets.get("days_ahead") or [], targets.get("dates") or [], moment.date())
-    windows = parse_windows(targets.get("time_windows") or [])
-    if not windows:
-        raise SystemExit("targets.time_windows 为空，不知道该盯哪些时段")
-    if not days:
-        raise SystemExit("targets.days_ahead 与 targets.dates 都为空，不知道该盯哪些日期")
+    # 每周固定盯场表：只有"今天这个周几"在表里才干活，否则一次请求都不发
+    try:
+        rules = parse_schedule(cfg.get("schedule"))
+    except ValueError as exc:
+        raise SystemExit(f"schedule 配置有误：{exc}") from exc
+    if not rules:
+        raise SystemExit("schedule 为空：请在 config.yaml 里配置要盯的星期与时段")
+
+    today_rules = rules_for_day(rules, moment)
+    if not today_rules:
+        log.info(
+            "今天%s 不在盯场表里（已配置：%s），本次不查询、不推送",
+            weekday_label(moment),
+            describe(rules),
+        )
+        return 0
+
+    windows = merged_windows(today_rules)
+    days = [moment.date()]
+    log.info("今天%s，盯 %s", weekday_label(moment), describe(today_rules))
 
     state_path = _state_path(cfg)
     state = State.load(state_path)
