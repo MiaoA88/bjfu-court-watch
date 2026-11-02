@@ -2,10 +2,11 @@ name: court-watch
 
 on:
   schedule:
-    # Keep in sync with config.yaml: active_hours 12:00-20:00 (Beijing) and the
-    # schedule weekdays. UTC 04:00-11:55 == Beijing 12:00-19:55.
+    # Every day. Hour range must match config.yaml active_hours 14:00-22:00
+    # (Beijing): UTC 06:00-13:55 == Beijing 14:00-21:55.
+    # Which dates to query is decided in code (plan_targets), not by cron.
     # tests/test_workflow_consistency.py enforces this match.
-    - cron: "*/5 4-11 * * 1,6"
+    - cron: "*/5 6-13 * * *"
   workflow_dispatch:
 
 concurrency:

@@ -7,13 +7,14 @@ import yaml
 from src import cli
 from src.matcher import Hit, Slot
 
-# 2026-11-02 是周一，2026-11-03 是周二，2026-11-07 是周六
-MONDAY = "2026-11-02"
-TUESDAY = "2026-11-03"
+MONDAY = "2026-11-02"      # 周一
+WEDNESDAY = "2026-11-04"   # 周三
 
 
 class Recorder:
     """替身通知器：记录下来，不发网络请求。"""
+
+    delivers = True
 
     def __init__(self):
         self.sent = []
@@ -22,12 +23,16 @@ class Recorder:
         self.sent.append((title, body))
 
 
+class SilentRecorder(Recorder):
+    delivers = False
+
+
 def write_config(tmp_path, **overrides):
     cfg = {
         "venue": {"hall_id": 54, "resource_ids": [156]},
         "schedule": [{"weekday": 1, "time_windows": ["20:00-21:00"]}],
-        "active_hours": ["12:00", "20:00"],
-        "notify": {"provider": "wxpusher_spt"},
+        "active_hours": ["14:00", "22:00"],
+        "notify": {"provider": "wxpusher_spt", "announce_schedule_changes": True},
         "state": {"path": str(tmp_path / "state.json")},
     }
     cfg.update(overrides)
@@ -42,45 +47,51 @@ def make_args(config, now, dry_run=False):
     )
 
 
-def make_hit(day, hour, name="7号场", rid="156#7号场", minutes=60):
-    start = time(hour, 0)
-    end = time((hour + minutes // 60) % 24, 0)
-    slot = Slot(
+def slot(day, start_hour, end_hour, name="1号塑胶场地", status=1, remaining=1):
+    return Slot(
         date=day,
-        start=start,
-        end=end,
-        resource_id=rid,
+        start=time(start_hour, 0),
+        end=time(end_hour, 0),
+        resource_id=f"156#{name}",
         resource_name=name,
-        remaining=1,
-        status=1,
+        remaining=remaining,
+        status=status,
     )
-    return Hit(date=day, start=start, end=end, resource_id=rid, resource_name=name, slots=(slot,))
 
 
-# ------------------------------------------------------------------ 闸门一：扫描窗口
+def stub_pipeline(monkeypatch, slots, recorder=None):
+    """把网络与推送全部打桩，只留编排逻辑。"""
+    recorder = recorder or Recorder()
+    monkeypatch.setattr(cli, "build_client", lambda cfg: object())
+    monkeypatch.setattr(cli, "fetch_resources", lambda client, hall_id: [])
+    monkeypatch.setattr(cli, "fetch_slots", lambda *a, **k: list(slots))
+    monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: recorder)
+    return recorder
+
+
+# ------------------------------------------------------------------ 闸门：扫描窗口
 def test_outside_active_hours_skips_everything(tmp_path, monkeypatch):
     monkeypatch.delenv("EHALL_COOKIE", raising=False)
     cfg = write_config(tmp_path)
-    # 21:00 已过扫描窗口 20:00
-    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T21:00:00")) == 0
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T22:00:00")) == 0  # 22:00 右开边界
     assert not (tmp_path / "state.json").exists(), "窗口外不应写状态"
 
 
-# ------------------------------------------------------------------ 闸门二：盯场表
-def test_weekday_not_in_schedule_does_not_run(tmp_path, monkeypatch):
-    """周二不在表里：一次请求都不该发。
-
-    这里故意不配 EHALL_COOKIE —— 只要走到建客户端就会 SystemExit，
-    因此返回 0 就证明了根本没碰网络。
-    """
-    monkeypatch.delenv("EHALL_COOKIE", raising=False)
-    cfg = write_config(tmp_path)
-    assert cli.cmd_watch(make_args(cfg, f"{TUESDAY}T13:00:00")) == 0
-    assert not (tmp_path / "state.json").exists()
+def test_empty_schedule_is_fatal(tmp_path):
+    cfg = write_config(tmp_path, schedule=[])
+    with pytest.raises(SystemExit):
+        cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:00:00"))
 
 
-def test_saturday_rule_only_fires_on_saturday(tmp_path, monkeypatch):
-    monkeypatch.delenv("EHALL_COOKIE", raising=False)
+def test_invalid_schedule_is_fatal(tmp_path):
+    cfg = write_config(tmp_path, schedule=[{"weekday": 9, "time_windows": ["20:00-21:00"]}])
+    with pytest.raises(SystemExit):
+        cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:00:00"))
+
+
+# ------------------------------------------------------------------ 每天都跑，查下一次
+def test_runs_on_non_matching_weekday_and_queries_remaining_week(tmp_path, monkeypatch):
+    """周三也要跑，但只查本周剩下的周六；周一那条已过去，不该再查。"""
     cfg = write_config(
         tmp_path,
         schedule=[
@@ -88,53 +99,140 @@ def test_saturday_rule_only_fires_on_saturday(tmp_path, monkeypatch):
             {"weekday": 6, "time_windows": ["14:00-15:00"]},
         ],
     )
-    # 周六 13:00 在表里 → 会去建客户端 → 缺 Cookie 触发告警分支（返回 0，但写了状态）
+    seen = []
+
+    def fake_fetch_slots(client, *, hall_id, day, page_size, available_status):
+        seen.append(day)
+        return [slot(day, 14, 15)]
+
+    recorder = Recorder()
+    monkeypatch.setattr(cli, "build_client", lambda cfg: object())
+    monkeypatch.setattr(cli, "fetch_resources", lambda client, hall_id: [])
+    monkeypatch.setattr(cli, "fetch_slots", fake_fetch_slots)
+    monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: recorder)
+
+    assert cli.cmd_watch(make_args(cfg, f"{WEDNESDAY}T15:00:00")) == 0
+    assert seen == [date(2026, 11, 7)], "周三只该查本周六"
+    assert any("空场" in title for title, _ in recorder.sent)
+
+
+def test_no_remaining_weekday_exits_without_requests(tmp_path, monkeypatch):
+    """周日跑、只配了周一周六：本周已无目标，零请求退出。"""
+    cfg = write_config(
+        tmp_path,
+        schedule=[
+            {"weekday": 1, "time_windows": ["20:00-21:00"]},
+            {"weekday": 6, "time_windows": ["14:00-15:00"]},
+        ],
+    )
+    monkeypatch.delenv("EHALL_COOKIE", raising=False)
+    assert cli.cmd_watch(make_args(cfg, "2026-11-08T15:00:00")) == 0
+    assert not (tmp_path / "state.json").exists()
+
+
+# ------------------------------------------------------------------ 盯场表变更通知
+def test_announces_schedule_on_first_run_only(tmp_path, monkeypatch):
+    cfg = write_config(tmp_path)
+    recorder = stub_pipeline(monkeypatch, [slot(date(2026, 11, 2), 20, 21)])
+
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:00:00")) == 0
+    announces = [t for t, _ in recorder.sent if "盯场表" in t]
+    assert len(announces) == 1
+    body = next(b for t, b in recorder.sent if "盯场表" in t)
+    assert "周一 20:00-21:00" in body
+
+    # 同配置再跑：不再公告
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:05:00")) == 0
+    assert len([t for t, _ in recorder.sent if "盯场表" in t]) == 1
+
+
+def test_announces_again_when_schedule_changes(tmp_path, monkeypatch):
+    recorder = stub_pipeline(monkeypatch, [slot(date(2026, 11, 2), 20, 21)])
+    cfg = write_config(tmp_path)
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:00:00")) == 0
+
+    cfg2 = write_config(
+        tmp_path,
+        schedule=[{"weekday": 1, "time_windows": ["19:00-21:00"]}],
+    )
+    assert cli.cmd_watch(make_args(cfg2, f"{MONDAY}T15:05:00")) == 0
+    bodies = [b for t, b in recorder.sent if "盯场表" in t]
+    assert len(bodies) == 2
+    assert "19:00-21:00" in bodies[-1]
+
+
+def test_announce_can_be_disabled(tmp_path, monkeypatch):
+    cfg = write_config(tmp_path, notify={"provider": "wxpusher_spt", "announce_schedule_changes": False})
+    recorder = stub_pipeline(monkeypatch, [slot(date(2026, 11, 2), 20, 21)])
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:00:00")) == 0
+    assert [t for t, _ in recorder.sent if "盯场表" in t] == []
+
+
+def test_silent_channel_does_not_record_fingerprint(tmp_path, monkeypatch):
+    cfg = write_config(tmp_path)
+    silent = SilentRecorder()
+    stub_pipeline(monkeypatch, [slot(date(2026, 11, 2), 20, 21)], silent)
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:00:00")) == 0
+
+    # 换回会投递的通道：应当补发一次公告
     recorder = Recorder()
     monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: recorder)
-    assert cli.cmd_watch(make_args(cfg, "2026-11-07T13:00:00")) == 0
-    assert (tmp_path / "state.json").exists(), "命中规则的那天应当继续执行"
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:05:00")) == 0
+    assert len([t for t, _ in recorder.sent if "盯场表" in t]) == 1
 
 
-def test_empty_schedule_is_fatal(tmp_path):
-    cfg = write_config(tmp_path, schedule=[])
-    with pytest.raises(SystemExit):
-        cli.cmd_watch(make_args(cfg, f"{MONDAY}T13:00:00"))
+# ------------------------------------------------------------------ 去重
+def test_second_run_does_not_repeat_the_same_slot(tmp_path, monkeypatch):
+    cfg = write_config(tmp_path)
+    recorder = stub_pipeline(monkeypatch, [slot(date(2026, 11, 2), 20, 21)])
+
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:00:00")) == 0
+    first_hits = [t for t, _ in recorder.sent if "空场" in t]
+    assert len(first_hits) == 1
+
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:05:00")) == 0
+    assert len([t for t, _ in recorder.sent if "空场" in t]) == 1, "同一空场不应重复推送"
 
 
-def test_invalid_schedule_is_fatal(tmp_path):
-    cfg = write_config(tmp_path, schedule=[{"weekday": 9, "time_windows": ["20:00-21:00"]}])
-    with pytest.raises(SystemExit):
-        cli.cmd_watch(make_args(cfg, f"{MONDAY}T13:00:00"))
+# ------------------------------------------------------------------ 可用性判定
+def test_unopened_slot_is_not_pushed(tmp_path, monkeypatch):
+    """status=5（未开放）即使 margin=1 也不能推。"""
+    cfg = write_config(tmp_path)
+    recorder = stub_pipeline(monkeypatch, [slot(date(2026, 11, 2), 20, 21, status=5)])
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:00:00")) == 0
+    assert [t for t, _ in recorder.sent if "空场" in t] == []
 
 
-# ------------------------------------------------------------------ 缺配置告警
+# ------------------------------------------------------------------ 缺配置
 def test_missing_cookie_alerts_once_per_day(tmp_path, monkeypatch):
     recorder = Recorder()
     monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: recorder)
     monkeypatch.delenv("EHALL_COOKIE", raising=False)
     cfg = write_config(tmp_path)
 
-    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T13:00:00")) == 0
-    assert len(recorder.sent) == 1
-    assert "配置" in recorder.sent[0][0]
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:00:00")) == 0
+    assert len([t for t, _ in recorder.sent if "配置" in t]) == 1
 
-    # 同一天再跑：不重复打扰
-    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T13:05:00")) == 0
-    assert len(recorder.sent) == 1
-
-    # 同一天第三次：仍然不重复打扰
-    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T13:10:00")) == 0
-    assert len(recorder.sent) == 1
+    assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:05:00")) == 0
+    assert len([t for t, _ in recorder.sent if "配置" in t]) == 1
 
 
 # ------------------------------------------------------------------ 消息渲染
+def make_hit(day, hour, name="7号场", rid="156#7号场", minutes=60):
+    start = time(hour, 0)
+    end = time((hour + minutes // 60) % 24, 0)
+    slot_obj = Slot(
+        date=day, start=start, end=end, resource_id=rid, resource_name=name, remaining=1, status=1
+    )
+    return Hit(date=day, start=start, end=end, resource_id=rid, resource_name=name, slots=(slot_obj,))
+
+
 def test_render_merges_courts_of_same_span():
     day = date(2026, 11, 5)
     hits = [make_hit(day, 18, name="1号场", rid="156#1"), make_hit(day, 18, name="2号场", rid="156#2")]
     title, body = cli.render_message(hits, 54, cli.now(), None)
 
     assert "1 个时段有空场" in title
-    assert "11-05" in body
     assert "18:00-19:00 · 2 块（1号场、2号场）" in body
     assert "场馆 54" in body
 

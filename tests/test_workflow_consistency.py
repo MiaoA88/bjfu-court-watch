@@ -1,6 +1,6 @@
 """守住 config.yaml 与 watch.yml 的一致性。
 
-cron 的星期列表和小时范围是从 config 推导出来的；一旦有人只改了一边，
+cron 的小时范围是从 config 的 active_hours 推导出来的；一旦有人只改了一边，
 线上就会"该跑的时候没跑"或"不该跑的时候空跑"，而且不会有任何告警。
 """
 
@@ -25,18 +25,17 @@ def trigger_block(workflow: dict) -> dict:
     return workflow.get("on") or workflow.get(True)
 
 
-def test_cron_matches_config_schedule_and_active_hours():
+def test_cron_matches_config_active_hours():
     config = load_yaml(CONFIG)
-    rules = parse_schedule(config["schedule"])
     active_hours = tuple(config.get("active_hours") or DEFAULT_ACTIVE_HOURS)
-    expected = cron_expression(rules, active_hours)
+    expected = cron_expression(active_hours)
 
     workflow = load_yaml(WORKFLOW)
     crons = [entry["cron"] for entry in trigger_block(workflow)["schedule"]]
 
     assert crons == [expected], (
         f"watch.yml 的 cron {crons} 与 config.yaml 推导出的 {expected} 不一致；"
-        "改盯场表时记得同步 cron"
+        "改扫描窗口时记得同步 cron"
     )
 
 
@@ -62,5 +61,4 @@ def test_workflow_comments_are_ascii_only():
 
 def test_config_schedule_is_not_empty():
     config = load_yaml(CONFIG)
-    rules = parse_schedule(config["schedule"])
-    assert rules, "schedule 为空会导致监控永不运行"
+    assert parse_schedule(config["schedule"]), "schedule 为空会导致监控永不运行"

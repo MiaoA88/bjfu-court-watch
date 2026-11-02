@@ -6,21 +6,24 @@
       - weekday: 1              # 周一
         time_windows: ["20:00-21:00"]
       - weekday: 6              # 周六
-        time_windows: ["14:00-16:00"]
+        time_windows: ["14:00-22:00"]     # 一个窗口跨多个场次也可以
 
-运行语义：
-  * 只在"今天这个周几"出现在表里时才查询；否则一次请求都不发（不消耗额度）。
-  * 查询的就是今天这一天的场地，命中即推送。
-  * 表不会被"本周过去了"清空，下周同一天继续生效。
+运行语义（只查本周还没过去的那些周几）：
+  * 学校每周一早上才放**本周**的场，所以不能查下周——那时还没开。
+  * 因此每条规则映射到"本周的那一天"（周一起算），且必须不早于今天；
+  * 周一运行会一次查到本周所有配置的周几，周中只查剩下的，周日之后自然空转；
+  * 表不会被"本周过去了"清空，下周一自动重新生效。
 
-cron 只在这几个周几触发，因此 cron 的星期列表必须与表一致；
-`cron_expression()` 负责推导，tests/test_workflow_consistency.py 负责守住两者不漂移。
+cron 每天触发，小时范围由扫描窗口换算成 UTC；
+`cron_expression()` 负责推导，tests/test_workflow_consistency.py 负责守漂移。
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any, Iterable
 
 from .matcher import parse_windows
@@ -38,8 +41,28 @@ class Rule:
 
     @property
     def label(self) -> str:
-        spans = "、".join(f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}" for s, e in self.windows)
-        return f"{WEEKDAY_NAMES[self.weekday]} {spans}"
+        return f"{WEEKDAY_NAMES[self.weekday]} {format_windows(self.windows)}"
+
+
+@dataclass(frozen=True)
+class Target:
+    """一次实际查询：某一天 + 该天要看的时段。"""
+
+    date: date
+    windows: tuple[tuple[time, time], ...]
+
+    @property
+    def label(self) -> str:
+        return f"{self.date.strftime('%m-%d')} 周{weekday_cn(self.date)} {format_windows(self.windows)}"
+
+
+def format_windows(windows: Iterable[tuple[time, time]]) -> str:
+    return "、".join(f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}" for s, e in windows)
+
+
+def _dedupe_sorted(windows: Iterable[tuple[time, time]]) -> tuple[tuple[time, time], ...]:
+    unique = sorted(set(windows), key=lambda w: (w[0], w[1]))
+    return tuple(unique)
 
 
 def parse_schedule(raw: Any) -> list[Rule]:
@@ -64,64 +87,59 @@ def parse_schedule(raw: Any) -> list[Rule]:
         raw_windows = item.get("time_windows", item.get("windows"))
         if not raw_windows:
             raise ValueError(f"schedule 第 {index} 项（{WEEKDAY_NAMES[weekday]}）没有配置 time_windows")
-        windows = tuple(parse_windows(raw_windows))
+        windows = _dedupe_sorted(parse_windows(raw_windows))
         rules.append(Rule(weekday=weekday, windows=windows))
     return rules
 
 
-def rules_for_day(rules: Iterable[Rule], day: datetime) -> list[Rule]:
-    """取出"今天这个周几"对应的规则；空列表表示今天不盯场。"""
-    return [rule for rule in rules if rule.weekday == day.isoweekday()]
+def plan_targets(rules: Iterable[Rule], moment: datetime) -> list[Target]:
+    """把盯场表映射成本次真正要查的日期。
 
-
-def merged_windows(rules: Iterable[Rule]) -> list[tuple[time, time]]:
-    """把同一天的多条规则合成一个时段列表（去重后按开始时间排序）。"""
-    seen: set[tuple[time, time]] = set()
-    merged: list[tuple[time, time]] = []
+    系统每周一早上才放本周的场，所以只在本周（周一起算）里取：
+    该周几对应本周的那一天，且不早于今天；本周已经过去的周几直接跳过，
+    因为那天的场次已经开场、也约不上了。
+    """
+    today = moment.date()
+    week_start = today - timedelta(days=today.isoweekday() - 1)
+    merged: dict[date, list[tuple[time, time]]] = {}
     for rule in rules:
-        for window in rule.windows:
-            if window not in seen:
-                seen.add(window)
-                merged.append(window)
-    merged.sort(key=lambda w: (w[0], w[1]))
-    return merged
+        day = week_start + timedelta(days=rule.weekday - 1)
+        if day < today:
+            continue
+        merged.setdefault(day, []).extend(rule.windows)
+    return [Target(date=day, windows=_dedupe_sorted(windows)) for day, windows in sorted(merged.items())]
+
+
+def describes_targets(targets: Iterable[Target]) -> str:
+    return "；".join(target.label for target in targets) if targets else "（空）"
 
 
 def describe(rules: Iterable[Rule]) -> str:
-    """给日志用：把整个表压成一行。"""
+    """给日志/推送用：把整个表压成一行。"""
     items = [rule.label for rule in rules]
     return "；".join(items) if items else "（空）"
 
 
-def weekday_label(day: datetime) -> str:
-    return f"周{weekday_cn(day.date())}"
+def fingerprint(rules: Iterable[Rule]) -> str:
+    """盯场表指纹，用于"表变了就推送一条最新时段"。"""
+    payload = [
+        [rule.weekday, [[s.strftime("%H:%M"), e.strftime("%H:%M")] for s, e in rule.windows]]
+        for rule in sorted(rules, key=lambda r: r.weekday)
+    ]
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return digest[:16]
 
 
 # --------------------------------------------------------------------- cron 推导
-def cron_dow(rules: Iterable[Rule]) -> str:
-    """把规则的周几集合变成 cron 的 day-of-week 字段，如 "1,6"。"""
-    days = sorted({rule.weekday for rule in rules})
-    if not days:
-        return "*"
-    # cron 的 0 和 7 都表示周日；这里统一用 7，和配置里的编号一致
-    return ",".join(str(d) for d in days)
+def cron_expression(active_hours: tuple[str, str] = ("14:00", "22:00")) -> str:
+    """推导出与扫描窗口一致的 cron（北京时间换算成 UTC）。
 
-
-def cron_expression(
-    rules: Iterable[Rule],
-    active_hours: tuple[str, str] = ("12:00", "20:00"),
-) -> str:
-    """推导出与配置一致的 cron（北京时间换算成 UTC）。
-
-    active_hours 是左闭右开，例如 12:00-20:00 覆盖 12..19 点，
-    换算成 UTC 就是 4..11 点。
+    每天都触发（具体查哪天由 plan_targets 决定，不靠 cron 的星期字段）。
+    active_hours 左闭右开：14:00-22:00 覆盖 14..21 点 → UTC 6..13 点。
     """
     start, end = active_window(active_hours)
     start_utc = (start.hour - 8) % 24
-    last_beijing_hour = (end.hour - 1) % 24
-    end_utc = (last_beijing_hour - 8) % 24
-    if start_utc <= end_utc:
-        hours = f"{start_utc}-{end_utc}"
-    else:  # 跨日窗口：cron 无法表达成一段，退化为全天并依赖代码闸门
-        hours = "*"
-    return f"*/5 {hours} * * {cron_dow(rules)}"
+    end_utc = ((end.hour - 1) % 24 - 8) % 24
+    hours = f"{start_utc}-{end_utc}" if start_utc <= end_utc else "*"
+    return f"*/5 {hours} * * *"
+

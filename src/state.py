@@ -31,6 +31,8 @@ class State:
     auth_alert_on: str | None = None
     # 场馆下的资源列表缓存：hall_id -> [{"id","name"}]
     resources: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    # 盯场表指纹：变了就推一条"当前最新时段"
+    schedule_fingerprint: str | None = None
     schema_version: int = SCHEMA_VERSION
 
     # ---------------------------------------------------------------- 去重
@@ -97,6 +99,7 @@ class State:
             consecutive_failures=int(raw.get("consecutive_failures") or 0),
             auth_alert_on=raw.get("auth_alert_on") or None,
             resources=resources if isinstance(resources, dict) else {},
+            schedule_fingerprint=raw.get("schedule_fingerprint") or None,
             schema_version=SCHEMA_VERSION,
         )
 
@@ -109,6 +112,7 @@ class State:
             "consecutive_failures": self.consecutive_failures,
             "auth_alert_on": self.auth_alert_on,
             "resources": self.resources,
+            "schedule_fingerprint": self.schedule_fingerprint,
         }
         tmp = file.with_suffix(file.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")

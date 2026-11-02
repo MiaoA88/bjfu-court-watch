@@ -23,9 +23,9 @@ from .ehall import (
     SchemaChanged,
     TransportError,
 )
-from .matcher import Hit, drop_started, select
+from .matcher import Hit, Slot, drop_started, select
 from .notify import ConsoleNotifier, NotifyError, build_notifier
-from .schedule import describe, merged_windows, parse_schedule, rules_for_day, weekday_label
+from .schedule import describe, describes_targets, fingerprint, parse_schedule, plan_targets
 from .state import State
 from .timeutil import DEFAULT_ACTIVE_HOURS, in_active_window, now, weekday_cn
 
@@ -90,7 +90,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     matching = cfg.get("matching") or {}
     notify_cfg = cfg.get("notify") or {}
 
-    # 每周固定盯场表：只有"今天这个周几"在表里才干活，否则一次请求都不发
+    # 盯场表：周几 + 该周几的时段。每天都跑，但只查"该周几的下一次"
     try:
         rules = parse_schedule(cfg.get("schedule"))
     except ValueError as exc:
@@ -98,18 +98,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if not rules:
         raise SystemExit("schedule 为空：请在 config.yaml 里配置要盯的星期与时段")
 
-    today_rules = rules_for_day(rules, moment)
-    if not today_rules:
-        log.info(
-            "今天%s 不在盯场表里（已配置：%s），本次不查询、不推送",
-            weekday_label(moment),
-            describe(rules),
-        )
+    targets = plan_targets(rules, moment)
+    log.info("盯场表：%s", describe(rules))
+    if not targets:
+        log.info("本周剩下的日期里没有配置的周几，本次不查询、不推送")
         return 0
-
-    windows = merged_windows(today_rules)
-    days = [moment.date()]
-    log.info("今天%s，盯 %s", weekday_label(moment), describe(today_rules))
+    log.info("本次要查：%s", describes_targets(targets))
 
     state_path = _state_path(cfg)
     state = State.load(state_path)
@@ -120,6 +114,20 @@ def cmd_watch(args: argparse.Namespace) -> int:
         _env("WXPUSHER_SPT"),
         dry_run=args.dry_run,
     )
+
+    # 盯场表变了就推一条"当前最新时段"，省得靠人肉确认改动生效没有
+    current_fingerprint = fingerprint(rules)
+    announce = bool(notify_cfg.get("announce_schedule_changes", True))
+    if state.schedule_fingerprint == current_fingerprint:
+        log.info("盯场表未变化（指纹 %s）", current_fingerprint)
+    elif not announce:
+        state.schedule_fingerprint = current_fingerprint
+    elif getattr(notifier, "delivers", False) or args.dry_run:
+        _announce_schedule(notifier, rules, moment)
+        if getattr(notifier, "delivers", False) and not args.dry_run:
+            state.schedule_fingerprint = current_fingerprint
+    else:
+        log.warning("盯场表有变化，但当前通道不投递，先不记账")
 
     try:
         client = build_client(cfg)
@@ -140,48 +148,43 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     available_status = int(venue.get("available_status", AVAILABLE_STATUS))
     page_size = int(venue.get("page_size", 20))
+    resource_ids = [str(x) for x in (venue.get("resource_ids") or [])]
+    minimum = int(matching.get("min_consecutive_slots", 1))
+    include = venue.get("resource_name_include") or []
+    exclude = venue.get("resource_name_exclude") or []
 
+    hits: list[Hit] = []
+    fetched = 0
     try:
-        slots = []
-        for index, day in enumerate(days):
-            slots.extend(
-                fetch_slots(
-                    client,
-                    hall_id=hall_id,
-                    day=day,
-                    page_size=page_size,
-                    available_status=available_status,
+        for index, target in enumerate(targets):
+            slots = fetch_slots(
+                client,
+                hall_id=hall_id,
+                day=target.date,
+                page_size=page_size,
+                available_status=available_status,
+            )
+            fetched += len(slots)
+            slots = _filter_slots(slots, resource_ids, moment)
+            hits.extend(
+                select(
+                    slots,
+                    target_dates=[target.date],
+                    windows=list(target.windows),
+                    min_consecutive_slots=minimum,
+                    include=include,
+                    exclude=exclude,
                 )
             )
-            if args.sleep_between and index < len(days) - 1:
+            if args.sleep_between and index < len(targets) - 1:
                 _sleep(args.sleep_between)
     except AuthExpired as exc:
         return _handle_error(state, state_path, notifier, moment, exc, kind="auth")
     except (ApiError, SchemaChanged, TransportError) as exc:
         return _handle_error(state, state_path, notifier, moment, exc, kind="other")
 
-    log.info("共取到 %d 个时段，目标日期 %s", len(slots), ", ".join(d.isoformat() for d in days))
-
-    # 一个场馆下可能挂着多个资源（54 = 羽毛球 156 + 乒乓球 157），按资源 id 收窄
-    resource_ids = [str(x) for x in (venue.get("resource_ids") or [])]
-    if resource_ids:
-        before = len(slots)
-        slots = [s for s in slots if s.resource_id.split("#", 1)[0] in resource_ids]
-        log.info("资源过滤 %s：%d → %d 格", resource_ids, before, len(slots))
-
-    before = len(slots)
-    slots = drop_started(slots, moment)
-    if before != len(slots):
-        log.info("剔除已开始的时段：%d → %d 格", before, len(slots))
-
-    hits = select(
-        slots,
-        target_dates=days,
-        windows=windows,
-        min_consecutive_slots=int(matching.get("min_consecutive_slots", 1)),
-        include=venue.get("resource_name_include") or [],
-        exclude=venue.get("resource_name_exclude") or [],
-    )
+    hits.sort(key=lambda hit: (hit.date, hit.start, hit.resource_name))
+    log.info("共取到 %d 格（%d 天），命中 %d 处", fetched, len(targets), len(hits))
     fresh = [h for h in hits if not state.already_notified(h.key(hall_id))]
 
     log.info("命中 %d 处，其中未推送过 %d 处", len(hits), len(fresh))
@@ -395,6 +398,33 @@ def cmd_smoke(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------- 工具
+def _filter_slots(slots: list[Slot], resource_ids: list[str], moment: datetime) -> list[Slot]:
+    """按资源下钻 + 剔除已经开始的时段。"""
+    kept = slots
+    if resource_ids:
+        kept = [s for s in kept if s.resource_id.split("#", 1)[0] in resource_ids]
+        log.info("资源过滤 %s：%d → %d 格", resource_ids, len(slots), len(kept))
+    before = len(kept)
+    kept = drop_started(kept, moment)
+    if before != len(kept):
+        log.info("剔除已开始的时段：%d → %d 格", before, len(kept))
+    return kept
+
+
+def _announce_schedule(notifier, rules, moment: datetime) -> None:
+    """盯场表变化时推一条，让人一眼看到线上到底在盯什么。"""
+    body = "\n".join(f"- {rule.label}" for rule in rules)
+    message = (
+        "盯场表已生效，之后每天按以下时段持续监控：\n\n"
+        f"{body}\n\n"
+        f"_更新于 {moment.strftime('%m-%d %H:%M')}_"
+    )
+    try:
+        notifier.send("⚙️ 盯场表已更新", message, None)
+    except NotifyError as exc:
+        log.error("盯场表通知推送失败：%s", exc)
+
+
 def _resolve_now(value: str | None) -> datetime:
     if not value:
         return now()

@@ -89,8 +89,16 @@ def _dt(day: date, clock: time):
 
 
 def parse_windows(values) -> list[tuple[time, time]]:
+    """接受多种写法：单个字符串、字符串列表、[start, end] 二元组。
+
+    一个窗口可以跨任意多个场次（"14:00-22:00" 会命中其中的每一个 1 小时场次）。
+    """
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
     windows: list[tuple[time, time]] = []
-    for raw in values or []:
+    for raw in values:
         if isinstance(raw, (list, tuple)) and len(raw) == 2:
             windows.append((parse_hhmm(raw[0]), parse_hhmm(raw[1])))
             continue
