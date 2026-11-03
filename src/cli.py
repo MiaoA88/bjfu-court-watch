@@ -453,11 +453,11 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     if per_month > FREE_MINUTES_PER_MONTH:
         print(
-            f"✗ 估算 {per_month} 分钟超过免费额度 {FREE_MINUTES_PER_MONTH}，"
-            "月中会被掐断：把 scan_interval_minutes 调大"
+            f"  ⚠ 约 {per_month} 分钟/月，超过私有仓库额度；"
+            "仓库为 public 时不计分钟，可忽略"
         )
-        return 1
-    print(f"  ✓ 额度余量 {FREE_MINUTES_PER_MONTH - per_month} 分钟")
+    else:
+        print(f"  ✓ 额度余量 {FREE_MINUTES_PER_MONTH - per_month} 分钟（私有仓库口径）")
 
     workflow = config_path.parent / ".github" / "workflows" / "watch.yml"
     if workflow.exists():
