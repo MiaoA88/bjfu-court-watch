@@ -2,6 +2,9 @@
 probe-out/
 .state/
 
+# 早期从学校站点抓的前端资产与接口字典：仅本地留存，公开仓库里不该有
+_probe/
+
 # Python
 __pycache__/
 *.py[cod]
