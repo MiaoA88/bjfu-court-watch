@@ -2,17 +2,19 @@ name: config-check
 
 # Fires immediately when config.yaml is pushed, so you get feedback within
 # seconds instead of waiting for the next scheduled scan (which GitHub may
-# delay or drop). Verifies the config parses and pushes the effective schedule
-# to your phone.
+# delay or drop). Validates the config, auto-syncs the cron in watch.yml,
+# commits that fix back, then pushes the effective schedule to your phone.
 
 on:
   push:
     paths:
       - "config.yaml"
+      - "src/**"
+      - "requirements.txt"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   announce:
@@ -29,8 +31,22 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Validate config
+      - name: Validate config and sync cron
         run: python -m src.cli check
+
+      # cli check rewrites watch.yml when active_hours changed but the cron did
+      # not follow. Commit it here so the new schedule actually takes effect.
+      - name: Commit cron fix if any
+        run: |
+          if git diff --quiet -- .github/workflows/watch.yml; then
+            echo "cron already in sync"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/watch.yml
+          git commit -m "chore: auto-sync watch.yml cron to active_hours"
+          git push
 
       - name: Announce effective schedule
         env:

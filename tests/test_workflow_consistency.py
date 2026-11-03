@@ -31,6 +31,12 @@ def trigger_block(workflow: dict) -> dict:
 
 
 def test_cron_matches_config_active_hours():
+    """CI 守门：cron 必须与 active_hours 一致。
+
+    注意 config-check.yml 里会先跑 `cli check`，它在发现不一致时**自动改写**
+    watch.yml 并提交回去，所以这条测试在 CI 里通常是绿的；
+    它的价值是防止有人绕过 cli check 直接手改 cron。
+    """
     config = load_yaml(CONFIG)
     active_hours = tuple(config.get("active_hours") or DEFAULT_ACTIVE_HOURS)
     interval = int(config.get("scan_interval_minutes", 15))
@@ -41,7 +47,7 @@ def test_cron_matches_config_active_hours():
 
     assert crons == [expected], (
         f"watch.yml 的 cron {crons} 与 config.yaml 推导出的 {expected} 不一致；"
-        "改扫描窗口或间隔时记得同步 cron"
+        "运行 `python -m src.cli check` 可自动修正"
     )
 
 
@@ -84,6 +90,17 @@ def test_all_workflows_are_ascii_only():
         text = path.read_text(encoding="utf-8")
         bad = [i for i, line in enumerate(text.splitlines(), 1) if any(ord(c) > 127 for c in line)]
         assert bad == [], f"{path.name} 第 {bad[0]} 行含非 ASCII 字符"
+
+
+def test_config_check_can_commit_cron_fix():
+    """config-check 必须能写回仓库，否则自动修正只存在于 runner 内存里。"""
+    workflow = load_yaml(CONFIG_CHECK)
+    assert workflow["permissions"]["contents"] == "write"
+
+    steps = workflow["jobs"]["announce"]["steps"]
+    runs = " ".join(str(s.get("run", "")) for s in steps)
+    assert "git push" in runs, "缺少把 cron 修正推回仓库的步骤"
+    assert "git diff --quiet" in runs, "应先判断是否真的需要提交"
 
 
 def test_config_check_triggers_on_config_push():

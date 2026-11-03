@@ -8,7 +8,7 @@ on:
     # Repo is public, so standard runner minutes are free.
     # NOTE: free runners routinely delay or drop high-frequency schedules.
     # tests/test_workflow_consistency.py enforces this match.
-    - cron: "*/5 4-13 * * *"
+    - cron: "*/5 4-14 * * *"
   workflow_dispatch:
 
 concurrency:

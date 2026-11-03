@@ -577,16 +577,27 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"  ✓ 额度余量 {FREE_MINUTES_PER_MONTH - per_month} 分钟（私有仓库口径）")
 
     workflow = config_path.parent / ".github" / "workflows" / "watch.yml"
-    if workflow.exists():
-        crons = [
-            line.split('"')[1]
-            for line in workflow.read_text(encoding="utf-8").splitlines()
-            if line.strip().startswith("- cron:")
-        ]
-        if crons and crons[0] != expected:
-            print(f"✗ watch.yml 里写的是 {crons[0]}，与上面推导值不一致，请同步修改")
-            return 1
+    if not workflow.exists():
+        return 0
+
+    text = workflow.read_text(encoding="utf-8")
+    crons = [
+        line.split('"')[1] for line in text.splitlines() if line.strip().startswith("- cron:")
+    ]
+    if not crons:
+        print("✗ watch.yml 里找不到 cron 行")
+        return 1
+
+    if crons[0] == expected:
         print("✓ watch.yml 的 cron 与扫描窗口一致")
+        return 0
+
+    # 不一致时**自动修正**，而不是报错等人改：
+    # 这个命令跑在 CI 里，若返回非零会让整条链路失败、也发不出通知。
+    print(f"  修正 cron：{crons[0]} → {expected}")
+    new_text = text.replace(f'- cron: "{crons[0]}"', f'- cron: "{expected}"')
+    workflow.write_text(new_text, encoding="utf-8")
+    print("✓ 已自动更新 watch.yml（提交后生效）")
     return 0
 
 
