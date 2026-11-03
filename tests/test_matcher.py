@@ -1,7 +1,7 @@
 from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
-from src.matcher import Hit, Slot, drop_started, parse_windows, select
+from src.matcher import Hit, Slot, cell_keys, drop_started, parse_windows, select
 
 DAY = date(2026, 11, 5)
 
@@ -95,18 +95,40 @@ def test_dates_outside_target_are_ignored():
     assert hits == []
 
 
-def test_hit_key_is_stable_and_hall_scoped():
+def test_slot_key_is_stable_and_hall_scoped():
+    """去重身份挂在**单个格子**上，不是挂在合并后的区间上。"""
+    cell = slot("18:00", "19:00", rid="7", name="7号场")
+    assert cell.key(54) == "54|2026-11-05|18:00|19:00|7"
+    assert cell.key("54") == cell.key(54)
+
     hit = Hit(
         date=DAY,
         start=time(18, 0),
         end=time(19, 0),
         resource_id="7",
         resource_name="7号场",
-        slots=(slot("18:00", "19:00"),),
+        slots=(cell,),
     )
-    assert hit.key(54) == "54|2026-11-05|18:00|19:00|7"
-    assert hit.key("54") == hit.key(54)
     assert hit.min_remaining == 1
+    assert cell_keys([hit], 54) == [cell.key(54)]
+
+
+def test_cell_keys_expands_contiguous_run():
+    """一小时的连续区间展开成多个格子键，避免区间漂移造成重复/漏报。"""
+    a = slot("18:00", "19:00")
+    b = slot("19:00", "20:00")
+    hit = Hit(
+        date=DAY,
+        start=time(18, 0),
+        end=time(20, 0),
+        resource_id="7",
+        resource_name="7号场",
+        slots=(a, b),
+    )
+    keys = cell_keys([hit], 54)
+    assert len(keys) == 2
+    assert "54|2026-11-05|18:00|19:00|7" in keys
+    assert "54|2026-11-05|19:00|20:00|7" in keys
 
 
 def test_status_five_is_not_available():

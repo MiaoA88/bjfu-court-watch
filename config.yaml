@@ -66,9 +66,13 @@ scan_interval_minutes: 5
 
 notify:
   provider: wxpusher_spt
-  # 同一空场（日期+时段+场地）整个生命周期内最多推几次
-  max_alerts_per_slot: 1
   detail_url: "https://ehall.bjfu.edu.cn/v2/reserve/hallView?id=54"
+  # 去重语义（不需要配置，说明放这里）：
+  #   以"单个场次格子"（日期+起止+场地）为单位记账。
+  #   * 上次被占用、这次变空闲 → 必推（被抢走又释放也算新机会）
+  #   * 一直空闲但从未推过   → 推一次
+  #   * 一直空闲且已推过     → 不推，避免每 5 分钟刷屏
+  # 所以"先报 21:00，后报 20:00"和"同一时段另一块场地也空了"都会再通知。
   # 盯场表有变化时推一条"当前最新时段"，方便确认改动生效
   announce_schedule_changes: true
   # 每天第一次运行时推一条"开始监控"，用来确认任务确实在跑

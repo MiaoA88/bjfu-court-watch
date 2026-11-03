@@ -176,6 +176,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     exclude = venue.get("resource_name_exclude") or []
 
     hits: list[Hit] = []
+    all_slots: list[Slot] = []
     fetched = 0
     cycle = CycleLog(moment)
     try:
@@ -189,6 +190,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             )
             fetched += len(slots)
             kept = _filter_slots(slots, resource_ids, moment)
+            all_slots.extend(kept)
             day_hits = select(
                 kept,
                 target_dates=[target.date],
@@ -208,9 +210,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     hits.sort(key=lambda hit: (hit.date, hit.start, hit.resource_name))
     log.info("共取到 %d 格（%d 天），命中 %d 处", fetched, len(targets), len(hits))
-    fresh = [h for h in hits if not state.already_notified(h.key(hall_id))]
 
-    log.info("命中 %d 处，其中未推送过 %d 处", len(hits), len(fresh))
+    fresh, released = _pick_fresh(hits, all_slots, state, hall_id, moment)
+    log.info(
+        "命中 %d 处；其中新释放的格子 %d 个、需推送的段 %d 处",
+        len(hits),
+        released,
+        len(fresh),
+    )
 
     if not fresh:
         state.record_success()
@@ -233,12 +240,63 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if not args.dry_run:
         if getattr(notifier, "delivers", False):
             for hit in fresh:
-                state.mark_notified(hit.key(hall_id), moment)
+                for slot in hit.slots:
+                    state.mark_notified(slot.key(hall_id), moment)
         else:
             # 没配 SPT / dry-run：消息没真正投递，不能记账，否则配好后会漏推
             log.warning("本轮未真正投递，不记录已推送状态，下次仍会重试这批空场")
         state.save(state_path)
     return 0
+
+
+def _pick_fresh(
+    hits: list[Hit],
+    all_slots: list[Slot],
+    state: State,
+    hall_id,
+    moment: datetime,
+) -> tuple[list[Hit], int]:
+    """按**单个场次格子**判定新鲜度，并更新占用状态。
+
+    对应你的要求：「设定时间内，有占用的场变为空场，就通知」。
+
+      规则 A（捡漏）：上次观察到占用/不可约，这次可用 → 必定通知，
+                     即使这个格子以前推过（被抢走又被释放，算新机会）。
+      规则 B（首次）：一直可用、但从未推送过 → 通知。
+      规则 C（常态）：一直可用、且已推过 → 不通知，避免每 5 分钟刷屏。
+      规则 D（占回）：本轮不可用 → 记入占用集合，等它释放时触发规则 A。
+
+    必须先读旧状态再更新，否则 mark_free 会提前抹掉"上次是占用"这个事实。
+    """
+    # ---- 阶段一：读旧状态，判定哪些格子新鲜
+    was_occupied: dict[str, bool] = {}
+    notified: dict[str, bool] = {}
+    for slot in all_slots:
+        key = slot.key(hall_id)
+        was_occupied[key] = state.was_occupied(key)
+        notified[key] = state.already_notified(key)
+
+    # ---- 阶段二：更新状态（占用/空闲），供下一轮使用
+    released = 0
+    for slot in all_slots:
+        key = slot.key(hall_id)
+        if slot.available:
+            if was_occupied[key]:
+                released += 1
+            state.mark_free(key)
+        else:
+            state.mark_occupied(key, moment)
+
+    # ---- 阶段三：挑出需要推送的格子
+    def is_new(key: str) -> bool:
+        if was_occupied[key]:
+            return True          # 规则 A
+        return not notified[key]  # 规则 B
+
+    fresh_hits = [
+        hit for hit in hits if any(is_new(s.key(hall_id)) for s in hit.slots)
+    ]
+    return fresh_hits, released
 
 
 def _handle_error(

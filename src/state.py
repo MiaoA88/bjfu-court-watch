@@ -22,9 +22,17 @@ SCHEMA_VERSION = 1
 
 @dataclass
 class State:
-    """notified: 已经推送过的空场键 → 推送时间（ISO8601）。"""
+    """状态仓库。
+
+    notified: 已推送过的**单个场次格子**（馆|日期|开始|结束|场地）→ 首次推送时间。
+        按格子而不是按"合并后的连续区间"记账，因为区间会随邻段变化漂移：
+        已报 20:00-22:00 后，20:00 被占只剩 21:00 时，若按区间记账会被当成新命中。
+    occupied: 上一次观察时**处于占用/不可约**的格子 → 观察时间。
+        "占用→空闲"就是捡漏成功，此时才推送；一直空闲的格子只报一次。
+    """
 
     notified: dict[str, str] = field(default_factory=dict)
+    occupied: dict[str, str] = field(default_factory=dict)
     # 连续请求失败次数，用于"失败 6 次才告警"
     consecutive_failures: int = 0
     # 登录态告警的日期（yyyy-mm-dd），用于"每天最多提醒一次"
@@ -44,26 +52,38 @@ class State:
     def mark_notified(self, key: str, when: datetime) -> None:
         self.notified[key] = when.isoformat(timespec="seconds")
 
+    def was_occupied(self, key: str) -> bool:
+        return key in self.occupied
+
+    def mark_occupied(self, key: str, when: datetime) -> None:
+        self.occupied[key] = when.isoformat(timespec="seconds")
+
+    def mark_free(self, key: str) -> None:
+        """格子恢复可约：从占用集合里移除，下一次再被占又会重新计入。"""
+        self.occupied.pop(key, None)
+
     def prune(self, today: date) -> int:
         """丢弃目标日期已过（含今天）的键：过了就永远不会再命中。
 
         键格式约定为 hall|date|start|end|resource，第二段是 yyyy-mm-dd。
+        occupied 用同一套键格式，一并剪除。
         """
         removed = []
-        for key in list(self.notified):
-            parts = key.split("|")
-            if len(parts) < 2:
-                removed.append(key)
-                continue
-            try:
-                target = date.fromisoformat(parts[1])
-            except ValueError:
-                removed.append(key)
-                continue
-            if target < today:
-                removed.append(key)
-        for key in removed:
-            self.notified.pop(key, None)
+        for store in (self.notified, self.occupied):
+            for key in list(store):
+                parts = key.split("|")
+                if len(parts) < 2:
+                    removed.append((store, key))
+                    continue
+                try:
+                    target = date.fromisoformat(parts[1])
+                except ValueError:
+                    removed.append((store, key))
+                    continue
+                if target < today:
+                    removed.append((store, key))
+        for store, key in removed:
+            store.pop(key, None)
         return len(removed)
 
     # ---------------------------------------------------------------- 失败计数
@@ -95,9 +115,11 @@ class State:
             return cls()
 
         notified = raw.get("notified") or {}
+        occupied = raw.get("occupied") or {}
         resources = raw.get("resources") or {}
         return cls(
             notified={str(k): str(v) for k, v in notified.items()} if isinstance(notified, dict) else {},
+            occupied={str(k): str(v) for k, v in occupied.items()} if isinstance(occupied, dict) else {},
             consecutive_failures=int(raw.get("consecutive_failures") or 0),
             auth_alert_on=raw.get("auth_alert_on") or None,
             resources=resources if isinstance(resources, dict) else {},
@@ -112,6 +134,7 @@ class State:
         payload = {
             "schema_version": self.schema_version,
             "notified": self.notified,
+            "occupied": self.occupied,
             "consecutive_failures": self.consecutive_failures,
             "auth_alert_on": self.auth_alert_on,
             "resources": self.resources,

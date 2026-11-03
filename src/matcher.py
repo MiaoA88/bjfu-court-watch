@@ -45,6 +45,22 @@ class Slot:
         w_start, w_end = window
         return self.start < w_end and self.end > w_start
 
+    def key(self, hall_id: str | int) -> str:
+        """单个场次格子的稳定身份：馆|日期|开始|结束|场地。
+
+        按格子记账，而不是按"合并后的连续区间"——后者会随邻段增减而漂移，
+        导致同一批格子被反复当成新命中。
+        """
+        return "|".join(
+            [
+                str(hall_id),
+                self.date.isoformat(),
+                self.start.strftime("%H:%M"),
+                self.end.strftime("%H:%M"),
+                self.resource_id,
+            ]
+        )
+
 
 @dataclass(frozen=True)
 class Hit:
@@ -65,16 +81,14 @@ class Hit:
     def label(self) -> str:
         return f"{self.start.strftime('%H:%M')}-{self.end.strftime('%H:%M')}"
 
-    def key(self, hall_id: str | int) -> str:
-        return "|".join(
-            [
-                str(hall_id),
-                self.date.isoformat(),
-                self.start.strftime("%H:%M"),
-                self.end.strftime("%H:%M"),
-                self.resource_id,
-            ]
-        )
+
+def cell_keys(hits: list[Hit], hall_id: str | int) -> list[str]:
+    """把命中展开成"格子键"清单（一段连续区间可能包含多个 1 小时格子）。"""
+    keys: list[str] = []
+    for hit in hits:
+        for slot in hit.slots:
+            keys.append(slot.key(hall_id))
+    return keys
 
 
 def _minutes_between(start: time, end: time) -> int:
@@ -136,7 +150,9 @@ def select(
     include: list[str] | None = None,
     exclude: list[str] | None = None,
 ) -> list[Hit]:
-    """筛选可用时段并合并成连续区间。
+    """筛选可用时段并合并成连续区间（用于展示）。
+
+    去重不在这里做——见 cli 里基于格子键的 _pick_fresh。
 
     规则：
       1. 日期在目标集合内、剩场 > 0；
