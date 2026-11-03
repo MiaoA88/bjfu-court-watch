@@ -1,0 +1,38 @@
+name: config-check
+
+# Fires immediately when config.yaml is pushed, so you get feedback within
+# seconds instead of waiting for the next scheduled scan (which GitHub may
+# delay or drop). Verifies the config parses and pushes the effective schedule
+# to your phone.
+
+on:
+  push:
+    paths:
+      - "config.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate config
+        run: python -m src.cli check
+
+      - name: Announce effective schedule
+        env:
+          WXPUSHER_SPT: ${{ secrets.WXPUSHER_SPT }}
+        run: python -m src.cli announce

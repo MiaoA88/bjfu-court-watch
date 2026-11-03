@@ -413,6 +413,55 @@ def _court_key(name: str) -> tuple[int, str]:
     return (int(digits) if digits else 9999, name)
 
 
+# --------------------------------------------------------------------- announce
+def cmd_announce(args: argparse.Namespace) -> int:
+    """配置一推送就把"当前生效的盯场表"发到手机。
+
+    独立于 watch：即使定时任务被 GitHub 丢弃，这条也能在 push 后几秒内反馈，
+    用来区分"改动没生效"和"任务根本没跑"。
+    """
+    cfg = load_config(args.config)
+    try:
+        rules = parse_schedule(cfg.get("schedule"))
+    except ValueError as exc:
+        print(f"✗ schedule 配置有误：{exc}")
+        return 1
+    if not rules:
+        print("✗ schedule 为空")
+        return 1
+
+    moment = _resolve_now(args.now)
+    active_hours = tuple(cfg.get("active_hours") or DEFAULT_ACTIVE_HOURS)
+    interval = int(cfg.get("scan_interval_minutes", 5))
+    targets = plan_targets(rules, moment)
+
+    lines = [
+        "### ⚙️ 盯场表已生效",
+        "",
+        f"**扫描窗口** {active_hours[0]}-{active_hours[1]} · 每 {interval} 分钟",
+        "",
+        "**每周盯场**",
+    ]
+    for rule in rules:
+        lines.append(f"- {rule.label}")
+    lines += ["", f"**本次要查**：{describes_targets(targets) if targets else '（本周已无目标）'}", ""]
+    lines.append(f"_更新于 {moment.strftime('%m-%d %H:%M')}_")
+
+    notifier = build_notifier(
+        (cfg.get("notify") or {}).get("provider", "wxpusher_spt"),
+        _env("WXPUSHER_SPT"),
+        dry_run=args.dry_run,
+    )
+    detail_url = (cfg.get("notify") or {}).get("detail_url")
+    try:
+        notifier.send("⚙️ 盯场表已生效", "\n".join(lines), detail_url)
+    except NotifyError as exc:
+        print(f"✗ 推送失败：{exc}")
+        return 1
+    print("✓ 已推送当前盯场表")
+    return 0
+
+
 # --------------------------------------------------------------------- probe
 def cmd_probe(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
@@ -672,6 +721,11 @@ def build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser("check", help="本地自检：配置能否解析、cron 是否同步")
     check.add_argument("--now", help="伪造当前时间（ISO8601）")
     check.set_defaults(func=cmd_check)
+
+    announce = sub.add_parser("announce", help="把当前生效的盯场表推送到手机")
+    announce.add_argument("--now", help="伪造当前时间（ISO8601）")
+    announce.add_argument("--dry-run", action="store_true", help="只打印不推送")
+    announce.set_defaults(func=cmd_announce)
     return parser
 
 

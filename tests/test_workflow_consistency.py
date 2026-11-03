@@ -14,6 +14,11 @@ from src.timeutil import DEFAULT_ACTIVE_HOURS
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "config.yaml"
 WORKFLOW = ROOT / ".github" / "workflows" / "watch.yml"
+CONFIG_CHECK = ROOT / ".github" / "workflows" / "config-check.yml"
+
+
+def all_workflows() -> list[Path]:
+    return sorted((ROOT / ".github" / "workflows").glob("*.yml"))
 
 
 def load_yaml(path: Path):
@@ -71,6 +76,35 @@ def test_workflow_comments_are_ascii_only():
     text = WORKFLOW.read_text(encoding="utf-8")
     bad = [(i, line) for i, line in enumerate(text.splitlines(), 1) if any(ord(c) > 127 for c in line)]
     assert bad == [], f"watch.yml 第 {bad[0][0]} 行含非 ASCII 字符：{bad[0][1]!r}"
+
+
+def test_all_workflows_are_ascii_only():
+    """所有 workflow 都必须纯 ASCII——含中文会被 GitHub 静默忽略。"""
+    for path in all_workflows():
+        text = path.read_text(encoding="utf-8")
+        bad = [i for i, line in enumerate(text.splitlines(), 1) if any(ord(c) > 127 for c in line)]
+        assert bad == [], f"{path.name} 第 {bad[0]} 行含非 ASCII 字符"
+
+
+def test_config_check_triggers_on_config_push():
+    """config.yaml 一推送就该立即跑一次，不必等定时任务。"""
+    workflow = load_yaml(CONFIG_CHECK)
+    trigger = trigger_block(workflow)
+    assert "push" in trigger, "缺少 push 触发"
+    assert workflow["jobs"] and "config.yaml" in " ".join(
+        str(p) for p in trigger["push"]["paths"]
+    )
+    assert "workflow_dispatch" in trigger, "保留手动触发便于排查"
+
+
+def test_config_check_pushes_announcement():
+    workflow = load_yaml(CONFIG_CHECK)
+    steps = workflow["jobs"]["announce"]["steps"]
+    runs = " ".join(str(s.get("run", "")) for s in steps)
+    assert "src.cli check" in runs, "应先校验配置"
+    assert "src.cli announce" in runs, "应推送当前盯场表"
+    env = next(s["env"] for s in steps if s.get("name") == "Announce effective schedule")
+    assert env["WXPUSHER_SPT"] == "${{ secrets.WXPUSHER_SPT }}"
 
 
 def test_config_schedule_is_not_empty():
