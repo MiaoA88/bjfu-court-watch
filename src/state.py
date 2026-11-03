@@ -33,6 +33,8 @@ class State:
     resources: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     # 盯场表指纹：变了就推一条"当前最新时段"
     schedule_fingerprint: str | None = None
+    # 已发过"开始运行"通知的日期（yyyy-mm-dd），每天只发一次
+    started_on: str | None = None
     schema_version: int = SCHEMA_VERSION
 
     # ---------------------------------------------------------------- 去重
@@ -100,6 +102,7 @@ class State:
             auth_alert_on=raw.get("auth_alert_on") or None,
             resources=resources if isinstance(resources, dict) else {},
             schedule_fingerprint=raw.get("schedule_fingerprint") or None,
+            started_on=raw.get("started_on") or None,
             schema_version=SCHEMA_VERSION,
         )
 
@@ -113,6 +116,7 @@ class State:
             "auth_alert_on": self.auth_alert_on,
             "resources": self.resources,
             "schedule_fingerprint": self.schedule_fingerprint,
+            "started_on": self.started_on,
         }
         tmp = file.with_suffix(file.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")

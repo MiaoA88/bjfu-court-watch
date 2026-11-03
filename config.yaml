@@ -71,6 +71,8 @@ notify:
   detail_url: "https://ehall.bjfu.edu.cn/v2/reserve/hallView?id=54"
   # 盯场表有变化时推一条"当前最新时段"，方便确认改动生效
   announce_schedule_changes: true
+  # 每天第一次运行时推一条"开始监控"，用来确认任务确实在跑
+  announce_start: true
 
 http:
   timeout_seconds: 15

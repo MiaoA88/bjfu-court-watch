@@ -152,6 +152,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
         message = str(exc)
         return _handle_error(state, state_path, notifier, moment, RuntimeError(message), kind="config")
 
+    # 每天第一次运行时发一条"开始运行"，方便确认监控活着
+    today_key = moment.date().isoformat()
+    if state.started_on != today_key and notify_cfg.get("announce_start", True):
+        if getattr(notifier, "delivers", False) or args.dry_run:
+            _announce_start(notifier, rules, targets, moment, notify_cfg.get("detail_url"))
+            if getattr(notifier, "delivers", False) and not args.dry_run:
+                state.started_on = today_key
+
     # 资源列表只用于日志，失败不致命
     if not state.resources.get(str(hall_id)):
         resources = fetch_resources(client, hall_id)
@@ -169,6 +177,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     hits: list[Hit] = []
     fetched = 0
+    cycle = CycleLog(moment)
     try:
         for index, target in enumerate(targets):
             slots = fetch_slots(
@@ -179,17 +188,17 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 available_status=available_status,
             )
             fetched += len(slots)
-            slots = _filter_slots(slots, resource_ids, moment)
-            hits.extend(
-                select(
-                    slots,
-                    target_dates=[target.date],
-                    windows=list(target.windows),
-                    min_consecutive_slots=minimum,
-                    include=include,
-                    exclude=exclude,
-                )
+            kept = _filter_slots(slots, resource_ids, moment)
+            day_hits = select(
+                kept,
+                target_dates=[target.date],
+                windows=list(target.windows),
+                min_consecutive_slots=minimum,
+                include=include,
+                exclude=exclude,
             )
+            cycle.add_day(target, len(slots), len(kept), len(day_hits))
+            hits.extend(day_hits)
             if args.sleep_between and index < len(targets) - 1:
                 _sleep(args.sleep_between)
     except AuthExpired as exc:
@@ -210,6 +219,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         return 0
 
     title, body = render_message(fresh, hall_id, moment, notify_cfg.get("detail_url"))
+    body = body + cycle.appendix()
     try:
         notifier.send(title, body, notify_cfg.get("detail_url"))
     except NotifyError as exc:
@@ -485,6 +495,66 @@ def _filter_slots(slots: list[Slot], resource_ids: list[str], moment: datetime) 
     if before != len(kept):
         log.info("剔除已开始的时段：%d → %d 格", before, len(kept))
     return kept
+
+
+class CycleLog:
+    """收集一轮运行的关键数字，作为推送附录，便于事后定位"为什么没报"。"""
+
+    def __init__(self, moment: datetime) -> None:
+        self.started = moment
+        self.days: list[dict[str, object]] = []
+        self.notes: list[str] = []
+
+    def add_day(self, target, fetched: int, kept: int, hits: int) -> None:
+        self.days.append(
+            {"label": target.label, "fetched": fetched, "kept": kept, "hits": hits}
+        )
+
+    def note(self, text: str) -> None:
+        self.notes.append(text)
+
+    @property
+    def total_fetched(self) -> int:
+        return sum(int(d["fetched"]) for d in self.days)
+
+    @property
+    def total_hits(self) -> int:
+        return sum(int(d["hits"]) for d in self.days)
+
+    def appendix(self) -> str:
+        """极简表格：每天取到多少格、留下多少、命中多少。"""
+        lines = [
+            "",
+            "---",
+            f"**运行日志** {self.started.strftime('%m-%d %H:%M')}",
+        ]
+        for day in self.days:
+            lines.append(
+                f"- {day['label']}：取到 {day['fetched']} 格 → 可用 {day['kept']} → 命中 {day['hits']}"
+            )
+        for note in self.notes:
+            lines.append(f"- {note}")
+        return "\n".join(lines)
+
+
+def _announce_start(notifier, rules, targets, moment: datetime, detail_url: str | None) -> None:
+    """每天第一次运行发一条，证明监控确实在跑。"""
+    lines = [
+        f"### ▶️ 今日开始监控",
+        "",
+        f"**扫描窗口** {moment.strftime('%H:%M')} 起，盯场表：",
+        "",
+    ]
+    for rule in rules:
+        lines.append(f"- {rule.label}")
+    lines.append("")
+    lines.append(f"**本次要查**：{describes_targets(targets)}")
+    lines.append("")
+    lines.append(f"_启动于 {moment.strftime('%m-%d %H:%M')}_")
+    try:
+        notifier.send("▶️ 场地监控已启动", "\n".join(lines), detail_url)
+    except NotifyError as exc:
+        log.error("启动通知推送失败：%s", exc)
 
 
 def _announce_schedule(notifier, rules, moment: datetime) -> None:
