@@ -46,9 +46,9 @@ schedule:
   - weekday: 5                     # 周五
     time_windows: ["19:00-22:00"]
   - weekday: 6                     # 周六
-    time_windows: ["13:00-22:00"]
+    time_windows: ["14:00-22:00"]
   - weekday: 7                     # 周日
-    time_windows: ["13:00-22:00"]
+    time_windows: ["14:00-22:00"]
 
 matching:
   # 至少连续几段才算命中；1 = 任一时段有空就推
