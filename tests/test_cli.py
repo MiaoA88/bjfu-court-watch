@@ -247,7 +247,8 @@ def test_check_accepts_dispatch_only_workflow(tmp_path, capsys):
     assert cli.cmd_check(args) == 0
     out = capsys.readouterr().out
     assert "cron-job.org" in out
-    assert "*/15 6-13" in out, "应给出 cron-job.org 的建议计划"
+    # 建议计划用北京时间（cron-job.org 可设 Asia/Shanghai），14:00-22:00 → 14-21
+    assert "*/15 14-21 * * *" in out, "应给出 cron-job.org 的建议计划"
 
 
 def test_check_reports_bad_yaml_instead_of_traceback(tmp_path, capsys):

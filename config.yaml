@@ -56,12 +56,14 @@ matching:
 
 # 扫描窗口（北京时间，左闭右开）。
 # 这是"我要盯的时间"，不是系统开关时间：系统 09:00-23:00 开放预约。
-# 12:00-23:00：空场是短暂释放的，白天时段同样值得盯。
-active_hours: ["12:00", "23:00"]
+# 10:00-23:00：空场是短暂释放的，白天时段同样值得盯。
+# 改这里之后必须同步改 cron-job.org 的计划，否则会出现"触发了但被代码挡掉"。
+active_hours: ["10:00", "23:00"]
 
-# 查询间隔（分钟）。仓库已转 public，标准 runner 不计分钟，额度不再约束，
-# 因此取 5 分钟（GitHub 免费 runner 的 cron 下限）。
-# 注意：实测免费 runner 对高频 schedule 会推迟甚至丢弃，见 README「调度可靠性」。
+# 查询间隔（分钟）。
+# 调度由 cron-job.org 通过 workflow_dispatch 触发，对应计划：
+#   */5 10-22 * * *   (时区 Asia/Shanghai)
+# 仓库是 public，标准 runner 不计分钟，所以 5 分钟一次没有成本。
 scan_interval_minutes: 5
 
 notify:

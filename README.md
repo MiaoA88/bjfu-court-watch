@@ -5,8 +5,9 @@
 
 - 盯场模型：`周几 + 该周几的时段`，按周重复（周一盯 20:00、周六盯 14:00 各管各的）
 - 查询范围：**每天都跑**，只查本周（周一起算）还没过去的周几，周一一次覆盖全周
-- 扫描窗口：北京时间 **09:00–22:00**（系统 09:00–23:00 开放预约）
-- 查询间隔：**15 分钟**（在这个窗口下是不超 Actions 额度的最密整步长，见下）
+- 扫描窗口：北京时间 **10:00–23:00**（系统 09:00–23:00 开放预约）
+- 查询间隔：**5 分钟**（156 次/天，public 仓库不计分钟）
+- 调度：**cron-job.org** 通过 REST API 触发 `workflow_dispatch`
 - 推送通道：WxPusher 极简推送（SPT）
 
 ---
@@ -146,6 +147,37 @@ python -m src.cli watch --now 2026-11-04T15:00:00   # 伪造时间验证"周三�
 ```
 
 ## 五、日常运维
+
+### 调度：cron-job.org
+
+GitHub 自带的 `schedule` 实测不可用（`*/5` cron 三天只触发 3 次、单次延迟 6 小时以上），
+所以改用 [cron-job.org](https://console.cron-job.org/) 通过 REST API 触发。
+
+任务配置：
+
+```
+URL      : https://api.github.com/repos/MiaoA88/bjfu-court-watch/actions/workflows/watch.yml/dispatches
+Method   : POST
+Body     : {"ref":"master"}
+Schedule : */5 10-22 * * *        (时区 Asia/Shanghai)
+Headers  : Accept: application/vnd.github+json
+           Authorization: Bearer <细粒度 PAT>
+           X-GitHub-Api-Version: 2022-11-28
+           Content-Type: application/json
+```
+
+返回码：`204` 成功；`401` PAT 失效；`403` 缺 `actions:write`；`404` 仓库/workflow 名或权限不对；`422` 分支名错。
+
+**两个必须记住的维护点**：
+
+1. **PAT 有有效期**。当前 token 到期日见 cron-job.org 的响应头
+   `github-authentication-token-expiration`。过期后任务会连续失败，
+   cron-job.org 在失败 25 次后**自动停用任务**。建议在日历上提前一周提醒自己。
+2. **改 `active_hours` 必须同步改 cron-job.org 的计划**。两边不一致会出现
+   「触发了但被代码窗口挡掉」的空转。`python -m src.cli check` 会打印应有的计划。
+
+> 注意：cron-job.org 文档里「每天 100 次」的限制是**其管理 API 的调用次数**
+> （即你用程序增删改任务的次数），不是任务执行次数。任务本身每小时最多 60 次。
 
 ### Cookie 过期
 

@@ -563,12 +563,11 @@ def cmd_check(args: argparse.Namespace) -> int:
     today = f"{moment:%Y-%m-%d} 周{weekday_cn(moment.date())}"
     print(f"  {today} 会查：{describes_targets(targets) if targets else '（本周已无目标，不会发请求）'}")
 
-    expected = cron_expression(active_hours, interval)
     per_day = daily_runs(active_hours, interval)
     per_month = monthly_minutes(active_hours, interval)
     print(f"  查询间隔：{interval} 分钟 → {per_day} 次/天")
-    print(f"  额度估算：约 {per_month} 分钟/月（按 31 天；GitHub 按 job 取整，每次 1 分钟）")
-    print(f"  cron 应为：{expected}")
+    print(f"  cron-job.org 计划：*/{interval} {_bj_hours_spec(active_hours)} * * *（时区 Asia/Shanghai）")
+    print(f"  额度估算：约 {per_month} 分钟/月（按 31 天；public 仓库不计分钟）")
 
     if per_month > FREE_MINUTES_PER_MONTH:
         print(
@@ -589,7 +588,6 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
 
     print("✓ watch.yml 无 GitHub 侧调度（由 cron-job.org 触发 workflow_dispatch）")
-    print(f"  cron-job.org 建议计划：*/{interval} {_bj_hours_spec(active_hours)} * * *")
     return 0
 
 
