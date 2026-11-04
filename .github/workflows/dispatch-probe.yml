@@ -1,0 +1,26 @@
+name: dispatch-probe
+
+# Temporary diagnostic: measures how reliably GitHub fires schedules on this
+# repo. Runs every 5 minutes around the clock and records the actual wall-clock
+# time it was dispatched, so we can see delays and dropped runs.
+# Delete this file once the question is answered.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Record dispatch time
+        run: |
+          echo "### dispatch probe" >> "$GITHUB_STEP_SUMMARY"
+          echo "- fired at $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S') Beijing" >> "$GITHUB_STEP_SUMMARY"
+          echo "- event: ${{ github.event_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "fired at $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S') Beijing"
