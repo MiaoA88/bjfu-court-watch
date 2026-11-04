@@ -1,14 +1,10 @@
 name: court-watch
 
 on:
-  schedule:
-    # Every day. Step and hour range must match config.yaml active_hours
-    # 12:00-22:00 (Beijing) + scan_interval_minutes 5:
-    # UTC 04:00-13:55 == Beijing 12:00-21:55.
-    # Repo is public, so standard runner minutes are free.
-    # NOTE: free runners routinely delay or drop high-frequency schedules.
-    # tests/test_workflow_consistency.py enforces this match.
-    - cron: "*/5 4-14 * * *"
+  # Triggered externally by cron-job.org via the workflow_dispatch REST API.
+  # GitHub's own schedule was measured at ~3 fires per 3 days for a */5 cron
+  # (delays of 6+ hours), so it is no longer used.
+  # See local-deploy/cronjob-config.py for the exact request to configure.
   workflow_dispatch:
 
 concurrency:

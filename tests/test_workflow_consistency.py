@@ -30,25 +30,25 @@ def trigger_block(workflow: dict) -> dict:
     return workflow.get("on") or workflow.get(True)
 
 
-def test_cron_matches_config_active_hours():
-    """CI 守门：cron 必须与 active_hours 一致。
+def test_watch_has_no_github_schedule():
+    """调度已交给 cron-job.org，watch.yml 不应再保留 schedule。
 
-    注意 config-check.yml 里会先跑 `cli check`，它在发现不一致时**自动改写**
-    watch.yml 并提交回去，所以这条测试在 CI 里通常是绿的；
-    它的价值是防止有人绕过 cli check 直接手改 cron。
+    实测 GitHub 免费 runner 对 */5 cron 三天只触发 3 次、单次延迟 6 小时以上，
+    因此改用外部定时器调 workflow_dispatch。留着 schedule 会形成两套定时器打架。
     """
-    config = load_yaml(CONFIG)
-    active_hours = tuple(config.get("active_hours") or DEFAULT_ACTIVE_HOURS)
-    interval = int(config.get("scan_interval_minutes", 15))
-    expected = cron_expression(active_hours, interval)
-
     workflow = load_yaml(WORKFLOW)
-    crons = [entry["cron"] for entry in trigger_block(workflow)["schedule"]]
+    trigger = trigger_block(workflow)
+    assert "schedule" not in trigger, "watch.yml 不应再有 schedule 触发"
+    assert "workflow_dispatch" in trigger, "必须保留 workflow_dispatch 供外部调用"
 
-    assert crons == [expected], (
-        f"watch.yml 的 cron {crons} 与 config.yaml 推导出的 {expected} 不一致；"
-        "运行 `python -m src.cli check` 可自动修正"
-    )
+
+def test_scan_interval_is_sane_for_external_cron():
+    """config 的间隔要能被 cron-job.org 的 cron 表达（1-59 分钟）。"""
+    config = load_yaml(CONFIG)
+    interval = int(config.get("scan_interval_minutes", 5))
+    assert 1 <= interval <= 59
+    # 能被 5 整除的间隔在 cron 里最规整
+    assert interval % 5 == 0, f"间隔 {interval} 分钟无法用整步长 cron 表达"
 
 
 def test_config_stays_within_actions_quota():

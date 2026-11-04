@@ -224,16 +224,30 @@ def test_check_passes_on_valid_config(tmp_path):
     assert cli.cmd_check(args) == 0
 
 
-def test_check_auto_fixes_cron_drift(tmp_path):
-    """cron 与窗口不一致时自动改写并返回 0（返回 1 会让 CI 链路断掉）。"""
+def test_check_rejects_leftover_schedule(tmp_path, capsys):
+    """watch.yml 里残留 cron 时应报错：调度已交给 cron-job.org，两套定时器会打架。"""
     cfg = write_config(tmp_path)
     workflow = tmp_path / ".github" / "workflows" / "watch.yml"
     workflow.parent.mkdir(parents=True)
     workflow.write_text('on:\n  schedule:\n    - cron: "*/5 0-5 * * *"\n', encoding="utf-8")
     args = argparse.Namespace(config=str(cfg), now=f"{MONDAY}T15:00:00", verbose=False)
 
+    assert cli.cmd_check(args) == 1
+    assert "cron-job.org" in capsys.readouterr().out
+
+
+def test_check_accepts_dispatch_only_workflow(tmp_path, capsys):
+    """只有 workflow_dispatch 的 watch.yml 才是正确状态。"""
+    cfg = write_config(tmp_path)
+    workflow = tmp_path / ".github" / "workflows" / "watch.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("on:\n  workflow_dispatch:\n", encoding="utf-8")
+    args = argparse.Namespace(config=str(cfg), now=f"{MONDAY}T15:00:00", verbose=False)
+
     assert cli.cmd_check(args) == 0
-    assert '*/15 6-13 * * *' in workflow.read_text(encoding="utf-8")
+    out = capsys.readouterr().out
+    assert "cron-job.org" in out
+    assert "*/15 6-13" in out, "应给出 cron-job.org 的建议计划"
 
 
 def test_check_reports_bad_yaml_instead_of_traceback(tmp_path, capsys):

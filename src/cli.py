@@ -37,7 +37,7 @@ from .schedule import (
     plan_targets,
 )
 from .state import State
-from .timeutil import DEFAULT_ACTIVE_HOURS, in_active_window, now, weekday_cn
+from .timeutil import DEFAULT_ACTIVE_HOURS, active_window, in_active_window, now, weekday_cn
 
 log = logging.getLogger("court")
 
@@ -583,24 +583,22 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 0
 
     text = workflow.read_text(encoding="utf-8")
-    crons = [
-        line.split('"')[1] for line in text.splitlines() if line.strip().startswith("- cron:")
-    ]
-    if not crons:
-        print("✗ watch.yml 里找不到 cron 行")
+    if "- cron:" in text:
+        # 调度已迁到 cron-job.org；watch.yml 里残留 schedule 会形成两套定时器。
+        print("✗ watch.yml 仍有 cron 行：调度已交给 cron-job.org，请删除 schedule 触发")
         return 1
 
-    if crons[0] == expected:
-        print("✓ watch.yml 的 cron 与扫描窗口一致")
-        return 0
-
-    # 不一致时**自动修正**，而不是报错等人改：
-    # 这个命令跑在 CI 里，若返回非零会让整条链路失败、也发不出通知。
-    print(f"  修正 cron：{crons[0]} → {expected}")
-    new_text = text.replace(f'- cron: "{crons[0]}"', f'- cron: "{expected}"')
-    workflow.write_text(new_text, encoding="utf-8")
-    print("✓ 已自动更新 watch.yml（提交后生效）")
+    print("✓ watch.yml 无 GitHub 侧调度（由 cron-job.org 触发 workflow_dispatch）")
+    print(f"  cron-job.org 建议计划：*/{interval} {_bj_hours_spec(active_hours)} * * *")
     return 0
+
+
+def _bj_hours_spec(active_hours) -> str:
+    """把北京时间的窗口转成 cron-job.org 的小时字段（它可设 Asia/Shanghai 时区）。"""
+    start, end = active_window(active_hours)
+    first = start.hour
+    last = (end.hour - 1) % 24
+    return f"{first}-{last}" if first <= last else "*"
 
 
 # --------------------------------------------------------------------- 工具
