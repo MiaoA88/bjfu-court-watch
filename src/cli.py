@@ -89,6 +89,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     moment = _resolve_now(args.now)
     active_hours = cfg.get("active_hours") or list(DEFAULT_ACTIVE_HOURS)
+    notify_cfg = cfg.get("notify") or {}
+
+    # 每次运行都留一条记录，即使落在窗口外——否则"任务跑了但没发消息"
+    # 和"任务根本没跑"无法区分，排查时只能靠翻 Actions 日志。
+    if not args.dry_run:
+        _heartbeat(moment, in_active_window(moment, active_hours), active_hours)
 
     if not in_active_window(moment, active_hours):
         log.info(
@@ -97,12 +103,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
             active_hours[0],
             active_hours[1],
         )
+        # 窗口外也要发一次"今日启动"，说明调度器至少派活过来了
+        _start_notice_if_needed(cfg, notify_cfg, moment, args)
         return 0
 
     venue = cfg.get("venue") or {}
     hall_id = venue.get("hall_id", 54)
     matching = cfg.get("matching") or {}
-    notify_cfg = cfg.get("notify") or {}
 
     # 盯场表：周几 + 该周几的时段。每天都跑，但只查"该周几的下一次"
     try:
@@ -153,12 +160,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         return _handle_error(state, state_path, notifier, moment, RuntimeError(message), kind="config")
 
     # 每天第一次运行时发一条"开始运行"，方便确认监控活着
-    today_key = moment.date().isoformat()
-    if state.started_on != today_key and notify_cfg.get("announce_start", True):
-        if getattr(notifier, "delivers", False) or args.dry_run:
-            _announce_start(notifier, rules, targets, moment, notify_cfg.get("detail_url"))
-            if getattr(notifier, "delivers", False) and not args.dry_run:
-                state.started_on = today_key
+    _start_notice_if_needed(cfg, notify_cfg, moment, args, state)
 
     # 资源列表只用于日志，失败不致命
     if not state.resources.get(str(hall_id)):
@@ -602,6 +604,83 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------- 工具
+def _heartbeat(moment: datetime, in_window: bool, active_hours) -> None:
+    """把每次运行写进 GitHub Actions 的 job summary，不推送、不耗额度。
+
+    Actions 页面能直接看到"今天几点跑过几次"，用来判断调度是否正常。
+    """
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    line = (
+        f"- {moment.strftime('%Y-%m-%d %H:%M')} "
+        f"{'✅ 窗口内' if in_window else '⏸ 窗口外'} "
+        f"({active_hours[0]}-{active_hours[1]})\n"
+    )
+    try:
+        with open(summary_path, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError:
+        pass
+
+
+def _start_notice_if_needed(
+    cfg: dict[str, Any],
+    notify_cfg: dict[str, Any],
+    moment: datetime,
+    args,
+    state: "State | None" = None,
+) -> None:
+    """每天首次运行发一条启动通知；窗口外也发，用来证明调度活着。
+
+    传 state 进来时复用它（调用方负责 save），否则自己加载并保存。
+    这样同一次运行里即使调用两次也不会重复推送。
+    """
+    if not notify_cfg.get("announce_start", True):
+        return
+    owns_state = state is None
+    if owns_state:
+        state = State.load(_state_path(cfg))
+    today_key = moment.date().isoformat()
+    if state.started_on == today_key:
+        return
+    try:
+        rules = parse_schedule(cfg.get("schedule"))
+    except ValueError:
+        return
+    if not rules:
+        return
+
+    notifier = build_notifier(
+        notify_cfg.get("provider", "wxpusher_spt"),
+        _env("WXPUSHER_SPT"),
+        dry_run=args.dry_run,
+    )
+    active_hours = cfg.get("active_hours") or list(DEFAULT_ACTIVE_HOURS)
+    in_window = in_active_window(moment, active_hours)
+    targets = plan_targets(rules, moment)
+
+    lines = ["### ▶️ 今日首次运行", ""]
+    if in_window:
+        lines.append(f"**扫描窗口** {active_hours[0]}-{active_hours[1]}，本次开始查询。")
+    else:
+        lines.append(
+            f"**注意**：本次运行于 {moment.strftime('%H:%M')}，"
+            f"在扫描窗口 {active_hours[0]}-{active_hours[1]} 之外，因此不会查询场地。"
+        )
+    lines += ["", "**本次要查**：" + (describes_targets(targets) if targets else "（本周已无目标）")]
+    lines += ["", f"_启动于 {moment.strftime('%m-%d %H:%M')}_"]
+
+    try:
+        notifier.send("▶️ 场地监控已启动", "\n".join(lines), notify_cfg.get("detail_url"))
+        if getattr(notifier, "delivers", False) and not args.dry_run:
+            state.started_on = today_key
+            if owns_state:
+                state.save(_state_path(cfg))
+    except NotifyError as exc:
+        log.error("启动通知推送失败：%s", exc)
+
+
 def _filter_slots(slots: list[Slot], resource_ids: list[str], moment: datetime) -> list[Slot]:
     """按资源下钻 + 剔除已经开始的时段。"""
     kept = slots
@@ -653,26 +732,6 @@ class CycleLog:
         for note in self.notes:
             lines.append(f"- {note}")
         return "\n".join(lines)
-
-
-def _announce_start(notifier, rules, targets, moment: datetime, detail_url: str | None) -> None:
-    """每天第一次运行发一条，证明监控确实在跑。"""
-    lines = [
-        f"### ▶️ 今日开始监控",
-        "",
-        f"**扫描窗口** {moment.strftime('%H:%M')} 起，盯场表：",
-        "",
-    ]
-    for rule in rules:
-        lines.append(f"- {rule.label}")
-    lines.append("")
-    lines.append(f"**本次要查**：{describes_targets(targets)}")
-    lines.append("")
-    lines.append(f"_启动于 {moment.strftime('%m-%d %H:%M')}_")
-    try:
-        notifier.send("▶️ 场地监控已启动", "\n".join(lines), detail_url)
-    except NotifyError as exc:
-        log.error("启动通知推送失败：%s", exc)
 
 
 def _announce_schedule(notifier, rules, moment: datetime) -> None:

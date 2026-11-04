@@ -154,8 +154,33 @@ def test_start_notification_can_be_disabled(tmp_path, monkeypatch):
     assert [t for t, _ in recorder.sent if "启动" in t] == []
 
 
-def test_start_notification_not_sent_outside_window(tmp_path, monkeypatch):
+def test_start_notification_still_sent_outside_window(tmp_path, monkeypatch):
+    """窗口外也要发：这是判断"调度器到底有没有派活"的唯一信号。
+
+    2026-11-04 全天没有任何消息，就是因为唯一一次 schedule 落在 04:31，
+    被窗口闸门挡住后直接 return，连启动通知都没发。
+    """
     cfg = write_config(tmp_path)
     recorder = stub(monkeypatch, [])
     assert cli.cmd_watch(make_args(cfg, "2026-11-02T23:00:00")) == 0
-    assert recorder.sent == []
+
+    starts = [t for t, _ in recorder.sent if "启动" in t]
+    assert len(starts) == 1
+    body = next(b for t, b in recorder.sent if "启动" in t)
+    assert "扫描窗口" in body and "之外" in body, "应说明本次落在窗口外、不会查询"
+    assert "不会查询场地" in body
+
+
+def test_heartbeat_written_to_step_summary(tmp_path, monkeypatch):
+    """每次运行都写 job summary，用于在 Actions 页面核对调度频次。"""
+    cfg = write_config(tmp_path)
+    stub(monkeypatch, [])
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+
+    cli.cmd_watch(make_args(cfg, "2026-11-02T15:00:00"))
+    cli.cmd_watch(make_args(cfg, "2026-11-02T23:30:00"))
+
+    text = summary.read_text(encoding="utf-8")
+    assert "窗口内" in text and "窗口外" in text
+    assert text.count("- ") == 2
