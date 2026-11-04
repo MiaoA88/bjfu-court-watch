@@ -78,18 +78,28 @@ def test_workflow_passes_all_three_secrets():
 
 
 def test_workflow_comments_are_ascii_only():
-    """GitHub 会静默丢弃含中文注释的 workflow，这条守着别再写回去。"""
+    """GitHub 会静默丢弃含中文**注释**的 workflow，这条守着别再写回去。"""
     text = WORKFLOW.read_text(encoding="utf-8")
     bad = [(i, line) for i, line in enumerate(text.splitlines(), 1) if any(ord(c) > 127 for c in line)]
     assert bad == [], f"watch.yml 第 {bad[0][0]} 行含非 ASCII 字符：{bad[0][1]!r}"
 
 
-def test_all_workflows_are_ascii_only():
-    """所有 workflow 都必须纯 ASCII——含中文会被 GitHub 静默忽略。"""
+def test_all_workflow_comments_are_ascii_only():
+    """所有 workflow 的**注释行**必须纯 ASCII。
+
+    只检查注释：中文出现在 run: 的脚本内容里是安全的（dispatch-probe 实测
+    能正常注册为 active 并执行）。历史上 watch.yml / smoke.yml 消失，
+    是中文注释触发的 YAML 解析问题。
+    """
     for path in all_workflows():
-        text = path.read_text(encoding="utf-8")
-        bad = [i for i, line in enumerate(text.splitlines(), 1) if any(ord(c) > 127 for c in line)]
-        assert bad == [], f"{path.name} 第 {bad[0]} 行含非 ASCII 字符"
+        offenders = []
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.strip()
+            if not stripped.startswith("#"):
+                continue
+            if any(ord(c) > 127 for c in line):
+                offenders.append(lineno)
+        assert offenders == [], f"{path.name} 第 {offenders[0]} 行的注释含非 ASCII 字符"
 
 
 def test_config_check_can_commit_cron_fix():
