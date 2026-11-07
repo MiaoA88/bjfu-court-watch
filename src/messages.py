@@ -43,8 +43,13 @@ def render_message(
     lines.append(f"_查询时间 {moment.strftime('%m-%d %H:%M')} · 场馆 {hall_id}_")
     body = "\n".join(lines).strip()
 
+    # 标题直接给出"最近哪个时段能打"，比"从哪天起有几个时段"更好扫读
     first_day = min(by_day)
-    title = f"🏸 {first_day.strftime('%m-%d')} 起 {total_spans} 个时段有空场"
+    first_start, first_end = min(by_day[first_day])
+    title = (
+        f"🏸 周{weekday_cn(first_day)}起"
+        f"{first_start.strftime('%H:%M')}-{first_end.strftime('%H:%M')}有空场"
+    )
     return title[:100], body
 
 
