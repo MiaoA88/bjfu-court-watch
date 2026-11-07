@@ -105,3 +105,19 @@ def test_console_notifier_records_messages():
     sink = ConsoleNotifier()
     sink.send("t", "body", None)
     assert sink.sent == [("t", "body", None)]
+
+
+@pytest.mark.parametrize("payload", [[], None, 42, "ok"])
+def test_non_object_json_is_reported_as_notify_error(payload):
+    with pytest.raises(NotifyError):
+        WxPusherSpt("SPT_test", session=FakeSession(payload)).send("t", "body")
+
+
+def test_http_failure_is_not_acknowledged_even_with_success_body():
+    class Session:
+        def post(self, *a, **kw):
+            response = FakeResponse({"code": 1000})
+            response.status_code = 503
+            return response
+    with pytest.raises(NotifyError, match="HTTP 503"):
+        WxPusherSpt("SPT_test", session=Session()).send("t", "body")

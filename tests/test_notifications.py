@@ -76,8 +76,8 @@ def test_cycle_log_appendix_lists_each_day():
 
     text = cycle.appendix()
     assert "**运行日志** 11-04 15:00" in text
-    assert "11-04 周三 20:00-21:00：取到 252 格 → 可用 84 → 命中 0" in text
-    assert "11-07 周六 14:00-22:00：取到 252 格 → 可用 90 → 命中 2" in text
+    assert "11-04 周三 20:00-21:00：取到 252 格 → 保留 84 → 命中 0" in text
+    assert "11-07 周六 14:00-22:00：取到 252 格 → 保留 90 → 命中 2" in text
     assert cycle.total_fetched == 504
     assert cycle.total_hits == 2
 
@@ -98,7 +98,7 @@ def test_hit_notification_contains_appendix(tmp_path, monkeypatch):
     assert len(hit_msgs) == 1
     body = hit_msgs[0]
     assert "运行日志" in body
-    assert "取到 1 格 → 可用 1 → 命中 1" in body
+    assert "取到 1 格 → 保留 1 → 命中 1" in body
 
 
 def test_no_hit_means_no_notification(tmp_path, monkeypatch):

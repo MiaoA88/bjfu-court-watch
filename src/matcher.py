@@ -33,8 +33,6 @@ class Slot:
     def available(self) -> bool:
         if self.remaining <= 0:
             return False
-        if self.status is None:  # 无状态码的来源（如测试/其他接口）退化为只看余量
-            return True
         return self.status == self.available_status
 
     @property
@@ -114,7 +112,10 @@ def parse_windows(values) -> list[tuple[time, time]]:
     windows: list[tuple[time, time]] = []
     for raw in values:
         if isinstance(raw, (list, tuple)) and len(raw) == 2:
-            windows.append((parse_hhmm(raw[0]), parse_hhmm(raw[1])))
+            start, end = parse_hhmm(raw[0]), parse_hhmm(raw[1])
+            if start >= end:
+                raise ValueError(f"时间窗口起点必须早于终点：{raw!r}")
+            windows.append((start, end))
             continue
         text = str(raw).strip().replace("–", "-").replace("—", "-").replace("~", "-")
         if "-" not in text:

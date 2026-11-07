@@ -14,6 +14,7 @@ def slot(start: str, end: str, remaining: int = 1, rid: str = "7", name: str = "
         resource_id=rid,
         resource_name=name,
         remaining=remaining,
+        status=1,
     )
 
 
@@ -146,11 +147,11 @@ def test_status_five_is_not_available():
     assert select([unopened], target_dates=[DAY], windows=parse_windows(["18:00-19:00"])) == []
 
 
-def test_slot_without_status_falls_back_to_remaining():
+def test_slot_without_status_is_not_available():
     no_status = Slot(
         date=DAY, start=time(18, 0), end=time(19, 0), resource_id="7", resource_name="7号场", remaining=2
     )
-    assert no_status.available is True
+    assert no_status.available is False
 
 
 def test_drop_started_removes_only_past_spans():

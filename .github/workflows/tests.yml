@@ -23,8 +23,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-          pip install pytest
+          pip install -r requirements-dev.txt
 
       - name: Run tests
         run: python -m pytest -q
+
+      - name: Validate repository config
+        run: python -m src.cli check

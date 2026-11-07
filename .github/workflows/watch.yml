@@ -2,9 +2,7 @@ name: court-watch
 
 on:
   # Triggered externally by cron-job.org via the workflow_dispatch REST API.
-  # GitHub's own schedule was measured at ~3 fires per 3 days for a */5 cron
-  # (delays of 6+ hours), so it is no longer used.
-  # See local-deploy/cronjob-config.py for the exact request to configure.
+  # See README.md for the request and timezone configuration.
   workflow_dispatch:
 
 concurrency:
@@ -29,13 +27,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Dedup state survives across runs: a unique key per run keeps the cache
-      # writable, and restore-keys picks the most recent entry.
+      # Restore the newest state. A distinct key also supports manual reruns.
       - name: Restore state
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .state
-          key: court-state-${{ github.run_id }}
+          key: court-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             court-state-
 
@@ -45,3 +42,11 @@ jobs:
           EHALL_UA: ${{ secrets.EHALL_UA }}
           WXPUSHER_SPT: ${{ secrets.WXPUSHER_SPT }}
         run: python -m src.cli watch
+
+      # Persist pending notifications even when sending fails.
+      - name: Save state
+        if: always() && hashFiles('.state/notified.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: court-state-${{ github.run_id }}-${{ github.run_attempt }}

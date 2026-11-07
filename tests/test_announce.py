@@ -88,3 +88,9 @@ def test_announce_dry_run_does_not_send(tmp_path, monkeypatch):
     assert rc == 0
     assert len(console.sent) == 1
     assert "盯场表已生效" in console.sent[0][0]
+
+
+def test_announce_missing_spt_returns_failure(tmp_path, monkeypatch):
+    monkeypatch.delenv("WXPUSHER_SPT", raising=False)
+    cfg = write_config(tmp_path)
+    assert cli.cmd_announce(argparse.Namespace(config=str(cfg), now=None, dry_run=False)) == 1

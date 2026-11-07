@@ -9,12 +9,12 @@
         time_windows: ["14:00-22:00"]     # 一个窗口跨多个场次也可以
 
 运行语义（只查本周还没过去的那些周几）：
-  * 学校每周一早上才放**本周**的场，所以不能查下周——那时还没开。
+  * 当前产品策略只查本周，不假设学校未来一定按同一放场规则运行。
   * 因此每条规则映射到"本周的那一天"（周一起算），且必须不早于今天；
   * 周一运行会一次查到本周所有配置的周几，周中只查剩下的，周日之后自然空转；
   * 表不会被"本周过去了"清空，下周一自动重新生效。
 
-cron 每天触发，小时范围由扫描窗口换算成 UTC；
+外部 cron 每天触发，可生成北京时间或 UTC 的小时范围；
 `cron_expression()` 负责推导，tests/test_workflow_consistency.py 负责守漂移。
 """
 
@@ -77,6 +77,8 @@ def parse_schedule(raw: Any) -> list[Rule]:
         if not isinstance(item, dict):
             raise ValueError(f"schedule 第 {index} 项必须是映射，收到 {type(item).__name__}")
         weekday = item.get("weekday", item.get("day"))
+        if isinstance(weekday, bool) or not isinstance(weekday, (str, int)):
+            raise ValueError(f"schedule 第 {index} 项 weekday 必须是整数")
         try:
             weekday = int(weekday)
         except (TypeError, ValueError):
@@ -95,11 +97,12 @@ def parse_schedule(raw: Any) -> list[Rule]:
 def plan_targets(rules: Iterable[Rule], moment: datetime) -> list[Target]:
     """把盯场表映射成本次真正要查的日期。
 
-    系统每周一早上才放本周的场，所以只在本周（周一起算）里取：
+    按本项目的本周查询策略，在本周（周一起算）里取：
     该周几对应本周的那一天，且不早于今天；本周已经过去的周几直接跳过，
     因为那天的场次已经开场、也约不上了。
     """
-    today = moment.date()
+    from .timeutil import TZ
+    today = moment.astimezone(TZ).date()
     week_start = today - timedelta(days=today.isoweekday() - 1)
     merged: dict[date, list[tuple[time, time]]] = {}
     for rule in rules:
@@ -171,19 +174,26 @@ def monthly_minutes(
 
 
 def cron_expression(
-    active_hours: tuple[str, str] = ("09:00", "22:00"),
-    interval: int = 15,
+    active_hours: tuple[str, str] = ("10:00", "23:00"),
+    interval: int = 5,
+    *,
+    utc: bool = True,
 ) -> str:
-    """推导出与扫描窗口、间隔一致的 cron（北京时间换算成 UTC）。
-
-    每天都触发；具体查哪天由 plan_targets 决定，不靠 cron 的星期字段。
-    active_hours 左闭右开：09:00-22:00 覆盖 9..21 点 → UTC 1..13 点。
-    """
+    """Generate an exact hour window, including windows crossing midnight."""
     start, end = active_window(active_hours)
-    start_utc = (start.hour - 8) % 24
-    end_utc = ((end.hour - 1) % 24 - 8) % 24
-    hours = f"{start_utc}-{end_utc}" if start_utc <= end_utc else "*"
-    runs_per_hour(interval)  # 复用校验
+    if start == end or start.minute or end.minute:
+        raise ValueError("cron 扫描窗口必须为不同的整点")
+    runs_per_hour(interval)
+    offset = 8 if utc else 0
+    hours = sorted((start.hour + i - offset) % 24 for i in range(window_hours(active_hours)))
+    spans = []
+    first = last = hours[0]
+    for hour in hours[1:]:
+        if hour == last + 1:
+            last = hour
+        else:
+            spans.append(str(first) if first == last else f"{first}-{last}")
+            first = last = hour
+    spans.append(str(first) if first == last else f"{first}-{last}")
     step = "*" if interval == 1 else f"*/{interval}"
-    return f"{step} {hours} * * *"
-
+    return f"{step} {','.join(spans)} * * *"

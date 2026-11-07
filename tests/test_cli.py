@@ -248,7 +248,7 @@ def test_check_accepts_dispatch_only_workflow(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "cron-job.org" in out
     # 建议计划用北京时间（cron-job.org 可设 Asia/Shanghai），14:00-22:00 → 14-21
-    assert "*/15 14-21 * * *" in out, "应给出 cron-job.org 的建议计划"
+    assert "*/5 14-21 * * *" in out, "应给出 cron-job.org 的建议计划"
 
 
 def test_check_reports_bad_yaml_instead_of_traceback(tmp_path, capsys):
@@ -265,6 +265,20 @@ def test_check_reports_bad_yaml_instead_of_traceback(tmp_path, capsys):
     args = argparse.Namespace(config=str(bad), now=f"{MONDAY}T15:00:00", verbose=False)
     assert cli.cmd_check(args) == 1
     assert "不是合法的 YAML" in capsys.readouterr().out
+
+
+def test_check_rejects_schedule_with_nonstandard_formatting(tmp_path):
+    cfg = write_config(tmp_path)
+    workflow = tmp_path / ".github/workflows/watch.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text('on: {workflow_dispatch: null, schedule: [{cron: "*/5 * * * *"}]}', encoding="utf-8")
+    assert cli.cmd_check(argparse.Namespace(config=str(cfg), now=None)) == 1
+
+
+def test_now_with_offset_is_normalized_to_beijing():
+    moment = cli._resolve_now("2026-11-08T18:00:00Z")
+    assert moment.date() == date(2026, 11, 9)
+    assert moment.hour == 2
 
 
 def test_check_flags_empty_schedule(tmp_path):

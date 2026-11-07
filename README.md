@@ -1,262 +1,215 @@
-# 北林羽毛球场「捡漏」监控
+# 北林羽毛球场余量监控
 
-按**每周固定盯场表**查询 [ehall 预约系统](https://ehall.bjfu.edu.cn/v2/reserve/hallView?id=54) 的场地余量，
-发现目标时段有空场就通过 WxPusher 推送到手机。**只查询、不下单**，收到通知后自己进系统预约。
+按每周盯场表查询预约系统，发现符合条件的空场后，通过 WxPusher SPT 提醒。只查询、发送通知，不提交预约；收到消息后需要自行预约。
 
-- 盯场模型：`周几 + 该周几的时段`，按周重复（周一盯 20:00、周六盯 14:00 各管各的）
-- 查询范围：**每天都跑**，只查本周（周一起算）还没过去的周几，周一一次覆盖全周
-- 扫描窗口：北京时间 **10:00–23:00**（系统 09:00–23:00 开放预约）
-- 查询间隔：**5 分钟**（156 次/天，public 仓库不计分钟）
-- 调度：**cron-job.org** 通过 REST API 触发 `workflow_dispatch`
-- 推送通道：WxPusher 极简推送（SPT）
+## 当前行为
 
----
+- 使用 `Asia/Shanghai` 时区，默认扫描窗口为 **10:00–23:00，左闭右开**。
+- 外部调度每 5 分钟启动一次，每轮完成后退出，不是常驻进程。
+- 只查询**本周尚未过去的目标日期**，周一起算，不查下周。这是项目策略，不是对学校放场规则的保证。
+- 默认查询场馆 `54` 中的羽毛球资源 `156`，支持场地名称筛选。
+- 可预约条件：`status == available_status`（默认 `1`）、`margin > 0`、场次尚未开始。
+- 时间窗口按区间重叠匹配，同场地相邻场次合并展示；`min_consecutive_slots` 是连续场次数，不是小时数。
 
-## 一、接口事实（实测，2026-11）
+当前配置理论上每天触发 156 次，31 天最多 4836 次，不含手动运行。每轮逐日查询多个日期，另有资源查询和失败重试，**一次运行不等于一个 HTTP 请求**。费用请按仓库方案、runner 类型和作业时长核对，本文不承诺固定免费额度。
 
-预约页是 Vue SPA，抓 HTML 只能拿到 `loading.gif`。真实数据在 JSON 接口里：
+## 快速开始
 
-```
-GET https://ehall.bjfu.edu.cn/site/reservation/list-page
-    ?hall_id=54&time=2026-11-03&p=1&page_size=20
-Cookie: PHPSESSID=...; vjuid=...; vjvd=...; vt=...
-→ {"e":0,"d":{"total":2,"list":[{"id":156,"name":"羽毛球综合场馆（收费）",
-      "table":{"595":[{"abscissa":"1号塑胶场地","yaxis":"18:00-19:00",
-                       "row":{"status":1,"total":1,"margin":1},"date":"2026-11-03"}, …]}}]}}
-```
-
-要点：
-
-- 参数是 **snake_case**（`hall_id` / `time`），驼峰会返回空数组。
-- 鉴权只靠 Cookie，**不需要**模拟点击或浏览器；`e=10042` 即登录态失效。
-- 场馆 54「多功能厅运动场地预约」下挂了两个项目：**羽毛球 156**、乒乓球 157。
-  乒乓球几乎全天空闲，必须用 `venue.resource_ids: [156]` 收窄，否则会刷屏。
-
-### status 语义（关键）
-
-| status | margin | 含义 | 算不算空场 |
-|---|---|---|---|
-| 1 | 1 | 可预约 | ✅ |
-| 3 | 0 | 已约满 | ❌ |
-| 4 | 0 | 不可预约（当日已过 / 该日停用） | ❌ |
-| 5 | 1 | **未开放**（未来日期还没放场） | ❌ |
-| 0 | 0/1 | 已过期（当天已过去的时段） | ❌ |
-
-**只看 `margin>0` 会把未来整月误报成空场**——未开放时 margin 同样返回 1。可用性必须判 `status==1`。
-
-另外实测放场窗口约 **7 天**（当天起 7 天可约，第 8 天起 `status=5`）。
-
-## 二、盯场表怎么配
-
-改 [config.yaml](config.yaml) 的 `schedule`，`weekday` 用 ISO 编号（1=周一 … 7=周日），
-日期和时段绑在一起，不同周几可以配不同时段：
-
-```yaml
-schedule:
-  - weekday: 1                     # 周一
-    time_windows: ["20:00-21:00"]
-  - weekday: 6                     # 周六
-    time_windows: ["14:00-22:00"]     # 一个窗口跨多个场次
-```
-
-**时段写法**（三种都支持）：
-
-```yaml
-time_windows: ["14:00-22:00"]                 # 单窗口，覆盖其间每个 1 小时场次
-time_windows: ["14:00-16:00", "19:00-21:00"]  # 多窗口，跳开中间时段
-time_windows: "14:00-22:00"                   # 只有一个窗口时可以省掉列表
-```
-
-匹配用的是**区间重叠**，不是字符串相等，所以 `14:00-22:00` 能命中 14:00-15:00、15:00-16:00……
-每一个场次；不要求窗口边界与场次边界对齐。
-
-**运行语义**：
-
-- 系统**每周一早上**才放本周的场，所以只查**本周（周一起算）还没过去的周几**。
-  周一运行会一次把本周所有配置的周几都查了；周中只查剩下的；过了就跳过。
-- 同一时段只在"占用 → 空闲"时通知，详见下面「去重语义」。
-- 表按周循环，不会因为本周过去被清空，下周一自动重新生效。
-- 本周已无目标日期时（例如周日只配了工作日），脚本直接退出，一次请求都不发。
-
-### 去重语义（什么时候会再通知）
-
-记账单位是**单个场次格子**（日期 + 开始 + 结束 + 场地），不是合并后的连续区间——
-后者会随邻段变化而漂移，导致误报或漏报。
-
-| 情形 | 是否通知 |
-|---|---|
-| 已报 21:00@6号，随后 20:00@6号 也空了 | ✅ 通知（新增格子） |
-| 已报 21:00@6号，随后 21:00@5号 也空了 | ✅ 通知（另一块场地） |
-| 已报的格子被抢走，之后又被释放 | ✅ 再通知（捡漏两次算两次） |
-| 一直空着、且已经报过的格子 | ❌ 不通知，避免每 5 分钟刷屏 |
-| 连续段从 20:00-22:00 缩成 21:00-22:00（20:00 被占） | ❌ 不通知，这不是新空场 |
-
-实现见 `src/cli.py` 的 `_pick_fresh`：先读旧状态判断"上次是否被占用"，
-再更新占用集合，最后只把含新格子的命中段拿去推送。
-
-## 三、改了配置怎么生效
-
-1. 改 [config.yaml](config.yaml)；
-2. `git add -A && git commit -m "..." && git push`；
-3. 下一次运行（≤5 分钟）就会用新配置——workflow 每次都 `actions/checkout`，读的是仓库最新版本。
-
-只改文件**不推送是不生效的**。
-
-推送后第一次运行会发一条「⚙️ 盯场表已更新」，正文就是当前生效的完整时段表，
-用来确认改动已经上线。这条只在表变化时发一次（靠状态里的指纹判断），不会每次刷。
-不想要就设 `notify.announce_schedule_changes: false`。
-
-## 四、部署
-
-### 1. 建私有仓库并推送
+Python 3.10 及以上；CI 使用 Python 3.12。从项目根目录执行：
 
 ```bash
-git remote add origin git@github.com:<用户名>/<仓库名>.git
-git push -u origin master
+python -m venv .venv
+# PowerShell：.venv\Scripts\Activate.ps1
+# Linux/macOS：source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m src.cli check
+python -m pytest -q
 ```
 
-### 2. 配三个 Secret
+生产环境只安装 `requirements.txt`。测试不访问真实预约接口、不发送通知。
 
-`Settings → Secrets and variables → Actions`：
+在当前 shell 或 GitHub Actions Secrets 中配置：
 
-| 名称 | 内容 |
-|---|---|
-| `EHALL_COOKIE` | 完整 Cookie 请求头，形如 `route=…; PHPSESSID=…; vjuid=…; vjvd=…; vt=…` |
-| `EHALL_UA` | 复制 Cookie 时**同一个浏览器**的 User-Agent |
-| `WXPUSHER_SPT` | `SPT_` 开头的令牌，[扫码获取](https://wxpusher.zjiecode.com/docs/spt.html) |
+| 环境变量 | 用途 |
+| --- | --- |
+| `EHALL_COOKIE` | 登录预约系统后，从浏览器 Network 复制的完整 Cookie 请求头 |
+| `EHALL_UA` | 同一浏览器的 User-Agent，建议随 Cookie 一起更新 |
+| `WXPUSHER_SPT` | WxPusher 极简推送令牌 |
 
-取 Cookie：登录预约页 → F12 → Network → 刷新 → 点任意 `site/reservation/...` 请求 →
-`Request Headers` 里复制 `Cookie:` 整行的值。**`vt=` 或 `vjvd=` 少一个就会 10042。**
-
-### 3. 连通性验证
-
-`Actions → smoke → Run workflow`，看日志末尾「判定」：
-
-| 结论 | 含义 |
-|---|---|
-| 网络可达，仅缺登录态（e=10042） | runner 能访问，配 Cookie 即可 |
-| Cookie 有效，接口直接返回数据 | 全部就绪 |
-| 返回的不是 JSON / 网络层失败 | 被 WAF 拦或需校内网络，见「换托管」 |
-
-### 4. 本地自检
+程序不自动加载 `.env`。不要把密钥写进源码、提交记录或公开日志。
 
 ```bash
-python -m src.cli probe              # 逐日拉余量，打印可约格数与状态分布
-python -m src.cli watch --dry-run    # 只打印不推送、不写状态
-python -m src.cli watch --now 2026-11-04T15:00:00   # 伪造时间验证"周三查下周一"
+python -m src.cli smoke
+python -m src.cli watch --dry-run
+python -m src.cli watch
 ```
 
-## 五、日常运维
+`watch --dry-run` **仍会访问真实接口，需要 Cookie**，但不推送、不写状态。离线验证请用测试、`check` 或 `announce --dry-run`。
 
-### 调度：cron-job.org
+## 配置
 
-GitHub 自带的 `schedule` 实测不可用（`*/5` cron 三天只触发 3 次、单次延迟 6 小时以上），
-所以改用 [cron-job.org](https://console.cron-job.org/) 通过 REST API 触发。
-
-任务配置：
-
-```
-URL      : https://api.github.com/repos/MiaoA88/bjfu-court-watch/actions/workflows/watch.yml/dispatches
-Method   : POST
-Body     : {"ref":"master"}
-Schedule : */5 10-22 * * *        (时区 Asia/Shanghai)
-Headers  : Accept: application/vnd.github+json
-           Authorization: Bearer <细粒度 PAT>
-           X-GitHub-Api-Version: 2022-11-28
-           Content-Type: application/json
-```
-
-返回码：`204` 成功；`401` PAT 失效；`403` 缺 `actions:write`；`404` 仓库/workflow 名或权限不对；`422` 分支名错。
-
-**两个必须记住的维护点**：
-
-1. **PAT 有有效期**。当前 token 到期日见 cron-job.org 的响应头
-   `github-authentication-token-expiration`。过期后任务会连续失败，
-   cron-job.org 在失败 25 次后**自动停用任务**。建议在日历上提前一周提醒自己。
-2. **改 `active_hours` 必须同步改 cron-job.org 的计划**。两边不一致会出现
-   「触发了但被代码窗口挡掉」的空转。`python -m src.cli check` 会打印应有的计划。
-
-> 注意：cron-job.org 文档里「每天 100 次」的限制是**其管理 API 的调用次数**
-> （即你用程序增删改任务的次数），不是任务执行次数。任务本身每小时最多 60 次。
-
-### Cookie 过期
-
-CAS 会话通常数小时到几天。过期后会自动推送「⚠️ ehall 登录态失效」，重新取 Cookie 更新 Secret 即可。
-
-### 场地名过滤
+实际配置为 `config.yaml`，以下是字段示例：
 
 ```yaml
 venue:
-  resource_ids: [156]              # 156=羽毛球，157=乒乓球
-  resource_name_include: ["1号", "2号"]   # 只盯 1、2 号塑胶场地
+  hall_id: 54
+  page_size: 20
+  available_status: 1
+  resource_ids: [156]
+  resource_name_include: []
+  resource_name_exclude: []
+schedule:
+  - weekday: 1
+    time_windows: ["19:00-22:00"]
+  - weekday: 6
+    time_windows: ["14:00-16:00", "19:00-21:00"]
 matching:
-  min_consecutive_slots: 2          # 必须连着两段都空
+  min_consecutive_slots: 1
+active_hours: ["10:00", "23:00"]
+scan_interval_minutes: 5
+notify:
+  provider: wxpusher_spt
+  detail_url: "https://ehall.bjfu.edu.cn/v2/reserve/hallView?id=54"
+  announce_schedule_changes: true
+  announce_start: true
+http:
+  timeout_seconds: 15
+  retries: 2
+state:
+  path: .state/notified.json
 ```
 
-## 六、已知限制
+- `weekday`：1=周一，7=周日；单窗口可直接写字符串，也可写多个窗口。
+- `active_hours`：两个不同的整点，支持跨午夜，如 `22:00–06:00`。非整点配置会被拒绝，避免生成不准确的 cron。
+- `scan_interval_minutes`：1–59 的整数。`*/N` 每小时重新计数，N 不整除 60 时跨小时的间隔不均匀。脚本本身不循环。
+- 场地 include/exclude：非空字符串列表，空列表不限制。
+- `http.retries`：首次请求之外的重试次数；超时必须为有限正数。
+- `state.path`：相对当前工作目录。云端 workflow 缓存 `.state`，更改路径时需同步修改缓存路径和保存条件。
 
-1. **cron 不精确**：GitHub `schedule` 最短 5 分钟，高负载时延迟数分钟、偶有跳过。放场瞬间可能正好被延迟错过。
-2. **Actions 额度**：见下面「额度怎么算」——按当前配置约 1612 分钟/月，余量 388。
-3. **Cookie 需手动续期**：统一身份认证有验证码，无法自动登录。
-4. **接口改版**：前端带 `appSourceV` 版本号。届时跑 `probe` 看状态分布是否异常，再据新响应调整 `availability.py`。
+`watch`、`check`、`announce`、`probe` 共用配置校验；非法类型、通知通道、时间窗口和数值范围提前报错。`smoke` 独立验证连通性，不读取配置。
 
-### 额度怎么算（容易算错的地方）
+修改后运行 `python -m src.cli check`，查看目标日期和建议 cron。它**不连接、不读取、不自动更新 cron-job.org**。更改窗口或间隔时，必须同步调整外部任务。
 
-**GitHub 按 job 向上取整到整分钟计费**——15 秒的 job 也记 1 分钟。
-所以我们每次运行（实测 14–33 秒）都消耗 **1 分钟**，与跑多久几乎无关。
-额度约束因此是「**每月运行次数 ≤ 2000**」，而不是「总时长」。
+## 云端部署
 
-9:00–22:00 是 13 小时，不同间隔的实际次数（`*/N` 不整除 60 时不是 60/N）：
+1. 将项目推送到自己的 GitHub 仓库，启用 Actions。
+2. 配置上述三个仓库 Secret。
+3. 手动运行 `smoke`，再运行 `court-watch`，确认扫描摘要和推送。
+4. 在 cron-job.org 配置任务，替换仓库、分支、令牌占位符：
 
-| 间隔 | 次/小时 | 次/天 | 分钟/月（31 天） | 结论 |
-|---|---|---|---|---|
-| `*/5` | 12 | 156 | 4836 | ❌ 月中被掐断 |
-| `*/10` | 6 | 78 | 2418 | ❌ 超 |
-| `*/12` | 5 | 65 | 2015 | ❌ 差 15 分钟 |
-| **`*/15`** | **4** | **52** | **1612** | ✅ 余量 388 |
-| `*/20` | 3 | 39 | 1209 | ✅ 但更稀疏 |
+```text
+URL: https://api.github.com/repos/<owner>/<repo>/actions/workflows/watch.yml/dispatches
+Method: POST
+Body: {"ref":"<default-branch>"}
+Timezone: Asia/Shanghai
+Schedule: */5 10-22 * * *
 
-所以 **15 分钟**是该窗口下不超额度、又最密的整步长。
-`python -m src.cli check` 会直接把这个账算给你，超了会返回非零并提示调大间隔。
-
-想让查询更密只有两条路：把仓库改成 **public**（公开仓库标准 runner 不计分钟），
-或用自托管 runner（也不计 GitHub 分钟）。
-
-### ⚠️ workflow 文件里不要写中文
-
-GitHub 对 `.github/workflows/*.yml` 的解析器**遇到中文注释会静默拒绝整个工作流**：
-文件在仓库里、`git push` 成功，但 `Actions` 页面看不到它，`gh workflow list` 也不列，
-且**不报任何错误**。本项目最初就是这样丢了 `watch.yml` 和 `smoke.yml`。
-workflow 里的注释一律用英文，中文说明放 README；`test_workflow_comments_are_ascii_only` 会守住这条。
-
-### 若 Actions 不可用
-
-代码与托管无关（读环境变量、写标准输出）。两种备选：境内云函数（腾讯云 SCF / 阿里云 FC）包一层入口；
-或本机 Windows 计划任务（校园网 IP 最可信，但电脑要开着）。
-
-## 七、实测记录（2026-11-02）
-
-- 本机与 **GitHub 托管 runner（境外 IP）** 都能直连 `ehall.bjfu.edu.cn`，未被 WAF 拦截。
-- 同一份 Cookie 在 runner 上返回 `e=0`，说明**会话不绑定 IP**——这是本方案最大的不确定性，已排除。
-- 单次运行 20–32 秒，资源过滤 2016 → 672 格，剔除已开始 672 → 600 格。
-- 场馆 54 下羽毛球仅 6 块场地（1–6 号塑胶场地），乒乓球 12 块；羽毛球晚间时段较紧张，符合"捡漏"场景。
-
-## 八、目录
-
-```
-src/cli.py           入口：watch / probe / smoke
-src/schedule.py      盯场表：解析、映射到具体日期、推导 cron、指纹
-src/ehall.py         HTTP 客户端、信封解析、错误分类、重试
-src/availability.py  list-page 解析：场地×时段网格 → Slot；含 probe 自检
-src/matcher.py       可用性判定、时段匹配、连续区间合并、剔除已开始
-src/state.py         跨运行去重状态、盯场表指纹
-src/notify.py        WxPusher SPT 推送
-src/timeutil.py      北京时间、扫描窗口
-tests/               114 个测试，不依赖网络
-_probe/              早期抓取的前端资产与接口字典（溯源用，不参与运行）
+Accept: application/vnd.github+json
+Authorization: Bearer <PAT>
+X-GitHub-Api-Version: 2022-11-28
+Content-Type: application/json
 ```
 
-## 九、合规
+PAT 需有目标仓库访问权限和触发 Actions 的权限。按 GitHub 当前设置选择最小权限，检查有效期、外部任务启用状态及执行记录。触发请求被接受不代表扫描成功，仍需查看 workflow 结果。
 
-只读轮询，每次 1 个请求。学校《场馆预约管理办法》可能限制脚本访问账号，请自评风险；
-勿外传 Cookie，勿用于代抢或牟利。
+| 工作流 | 职责 |
+| --- | --- |
+| `watch.yml` | 手动或外部触发扫描，恢复状态，扫描失败后仍尝试保存状态 |
+| `tests.yml` | push / PR 时运行离线测试和配置自检 |
+| `config-check.yml` | 配置或代码变更后校验，默认分支额外发配置公告，不提交文件 |
+| `smoke.yml` | 手动验证 runner 连通性 |
+
+工作流只申请仓库内容读取权限。监控使用 concurrency 串行运行；状态缓存键包含运行 ID 和重跑次数。不要让本地和另一个调度器同时写同一个状态文件。
+
+## 去重与重试
+
+记账单位是“场馆 + 日期 + 开始 + 结束 + 场地”，不是展示用的连续区间。
+
+| 场景 | 行为 |
+| --- | --- |
+| 首次发现空场 | 通知一次 |
+| 一直空闲且已成功通知 | 不重复通知 |
+| 已报格子被占后重新释放 | 创建新的待通知机会 |
+| 发送失败或缺少 SPT | 保留待通知，后续确认仍可约且符合规则时补发 |
+| 待通知格子又被占用 | 撤销旧机会；再次释放时重新记录 |
+| 连续区间缩短 | 不把边界变化当成新空场 |
+
+`pending` 与观测状态 `occupied` 分开保存。只有真实推送通道返回成功，才移除待通知并记录 `notified`。旧版状态文件仍可读取，新字段默认初始化，无需删除旧状态。
+
+消息发送和状态保存不能形成跨服务事务：发送成功后进程中断或缓存丢失，可能重复通知，不承诺严格“恰好一次”。
+
+## 告警与健康状态
+
+- **盯场表公告**：成功后才记录指纹，失败后重试，可关闭。独立 `announce` 不写监控指纹，可能与下次扫描公告重复。
+- **每日启动**：当天首次符合执行路径的运行发送，可关闭；只证明任务执行过，不代表查询成功。窗口外可能发送启动说明，本周无目标时直接退出。
+- **鉴权或缺 Cookie**：成功提醒后当天抑制重复；缺 SPT 或发送失败不记为已提醒，成功查询后解除旧告警状态。
+- **连续查询失败**：达到 6 次尝试告警，失败后每隔至少 15 分钟重试；同一连续故障成功告警一次，成功扫描后重置。
+- **长时间无成功扫描**：扫描窗口内至少 30 分钟无成功记录，下一次运行检查并提醒，重试间隔至少 15 分钟；正常夜间停扫不会在开窗瞬间触发。
+
+**调度器完全停止时，程序不能唤醒自己告警。** 请在外部调度服务启用失败提醒，或让独立监控检查最近运行时间。新安装、缓存丢失时，没有足够历史推断此前是否中断。
+
+```bash
+python -m src.cli status
+python -m src.cli -c config.yaml check --now 2026-11-04T15:00:00
+python -m src.cli announce --dry-run
+python -m src.cli probe --days 3
+```
+
+全局 `-c`、`-v` 放在子命令之前。`--now` 无时区时按北京时间解释，带偏移量时转换到北京时间。它只改变本地判断，不让接口返回历史快照。
+
+`status` 只读取本机状态，不下载云端缓存。Actions 摘要和状态文件记录最近尝试/成功时间、已查日期数、格子数、命中数、通知结果、待通知数量与连续查询失败次数。`status=ok` 只表示查询成功；`notification=failed` 表示投递仍需处理，通知失败不增加查询失败计数。待通知数量可能包含当前规则不匹配的格子，不等于下一条消息数量。
+
+| 现象 | 排查方向 |
+| --- | --- |
+| 没有运行记录 | 外部任务、PAT、分支、workflow 名及排队 |
+| 运行但没查询 | 扫描窗口、本周剩余目标日期 |
+| 登录态失效 | 重新登录并更新 Cookie，必要时同步 UA |
+| `SchemaChanged` | 字段、结构、分页或日期异常，用 `probe` 检查 |
+| 查询正常却无通知 | SPT、通知结果、是否已通知 |
+| 缓存丢失后重复提醒 | 状态历史丢失，不等于去重失效 |
+
+`check`、`announce` 校验或投递失败返回非零；空场通知失败也返回非零。已分类的接口和鉴权错误由 `watch` 记录并告警后返回 0，避免每轮失败邮件。不能仅凭 workflow 绿色判断业务健康。
+
+## 接口边界
+
+当前使用 `GET /site/reservation/list-page`，参数为 `hall_id`、`time`、`p=1`、`page_size`，读取 `list[].table`。默认仅状态 `1` 视为可预约。缺少 `status`、`margin`、场地名称、合法日期或网格结构会抛出 `SchemaChanged`；明确的空列表是合法空结果。
+
+若 `total` 表明第一页不完整，会拒绝把部分数据当完整扫描，提示检查分页或增加 `page_size`。当前没有自动翻页。`probe` 保存首日原始业务响应到已忽略的 `probe-out/`，请勿随意公开原始数据。学校接口、访问限制和放场方式可能变化，以实际验证和学校规则为准。
+
+项目不再把中文注释视为非法，工作流测试检查 YAML 结构、触发器和权限。
+
+## 代码结构与开发
+
+```text
+src/
+  cli.py           参数、命令和扫描编排
+  config.py        统一配置读取与校验
+  schedule.py      周计划、日期、cron、运行规模
+  timeutil.py      北京时间与窗口工具
+  ehall.py         HTTP、重试、信封与错误分类
+  availability.py  接口结构校验与场次解析
+  matcher.py       场地筛选、重叠与连续区间
+  dedup.py         观测变化和待通知机会
+  state.py         状态兼容读取、原子写入和清理
+  notify.py        WxPusher、日志及预览通道
+  alerts.py        查询/鉴权告警与重试
+  health.py        健康摘要与扫描中断提醒
+  messages.py      通知正文、排序、扫描附录
+tests/             离线测试与跨轮次故障回归
+.github/workflows/ CI 与云端监控
+config.yaml        实际盯场配置
+requirements.txt   运行依赖
+requirements-dev.txt  测试依赖
+```
+
+`.state/`、`probe-out/`、`_probe/`、`local-deploy/` 是本地状态、诊断产物或个人部署辅助文件，不是仓库安装前提。保留 `python -m src.cli` 入口，不要求修改已有启动命令。
+
+修改实现后执行：
+
+```bash
+python -m pytest -q
+python -m src.cli check
+python -m compileall -q src tests
+```
+
+回归测试覆盖重新释放补发、通知指纹、告警冷却、接口异常、配置错误、跨午夜调度、旧状态兼容和失败时保存状态。测试数量以实际运行结果为准。

@@ -240,3 +240,14 @@ def test_interval_is_validated():
         runs_per_hour(0)
     with pytest.raises(ValueError):
         cron_expression(("09:00", "22:00"), 60)
+
+
+def test_local_cron_handles_cross_midnight_without_all_day_fallback():
+    assert cron_expression(("22:00", "06:00"), 5, utc=False) == "*/5 0-5,22-23 * * *"
+    assert cron_expression(("06:00", "10:00"), 5) == "*/5 0-1,22-23 * * *"
+
+
+def test_timezone_conversion_across_week_boundary():
+    rules = parse_schedule([{"weekday": 1, "time_windows": ["20:00-21:00"]}])
+    sunday_utc = datetime.fromisoformat("2026-11-08T18:00:00+00:00")
+    assert plan_targets(rules, sunday_utc)[0].date == date(2026, 11, 9)

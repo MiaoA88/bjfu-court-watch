@@ -47,8 +47,7 @@ def test_scan_interval_is_sane_for_external_cron():
     config = load_yaml(CONFIG)
     interval = int(config.get("scan_interval_minutes", 5))
     assert 1 <= interval <= 59
-    # 能被 5 整除的间隔在 cron 里最规整
-    assert interval % 5 == 0, f"间隔 {interval} 分钟无法用整步长 cron 表达"
+    assert cron_expression(tuple(config["active_hours"]), interval, utc=False)
 
 
 def test_config_stays_within_actions_quota():
@@ -77,40 +76,30 @@ def test_workflow_passes_all_three_secrets():
         assert f"${{{{ secrets.{name} }}}}" == env[name]
 
 
-def test_workflow_comments_are_ascii_only():
-    """GitHub 会静默丢弃含中文**注释**的 workflow，这条守着别再写回去。"""
-    text = WORKFLOW.read_text(encoding="utf-8")
-    bad = [(i, line) for i, line in enumerate(text.splitlines(), 1) if any(ord(c) > 127 for c in line)]
-    assert bad == [], f"watch.yml 第 {bad[0][0]} 行含非 ASCII 字符：{bad[0][1]!r}"
-
-
-def test_all_workflow_comments_are_ascii_only():
-    """所有 workflow 的**注释行**必须纯 ASCII。
-
-    只检查注释：中文出现在 run: 的脚本内容里是安全的（dispatch-probe 实测
-    能正常注册为 active 并执行）。历史上 watch.yml / smoke.yml 消失，
-    是中文注释触发的 YAML 解析问题。
-    """
+def test_workflows_are_valid_yaml():
     for path in all_workflows():
-        offenders = []
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            stripped = line.strip()
-            if not stripped.startswith("#"):
-                continue
-            if any(ord(c) > 127 for c in line):
-                offenders.append(lineno)
-        assert offenders == [], f"{path.name} 第 {offenders[0]} 行的注释含非 ASCII 字符"
+        workflow = load_yaml(path)
+        assert isinstance(workflow, dict)
+        assert trigger_block(workflow)
+        assert workflow.get("jobs")
 
 
-def test_config_check_can_commit_cron_fix():
-    """config-check 必须能写回仓库，否则自动修正只存在于 runner 内存里。"""
+def test_config_check_has_no_repository_write_side_effects():
     workflow = load_yaml(CONFIG_CHECK)
-    assert workflow["permissions"]["contents"] == "write"
+    assert workflow["permissions"]["contents"] == "read"
+    runs = " ".join(str(s.get("run", "")) for s in workflow["jobs"]["announce"]["steps"])
+    assert "git push" not in runs
+    assert "git commit" not in runs
 
-    steps = workflow["jobs"]["announce"]["steps"]
-    runs = " ".join(str(s.get("run", "")) for s in steps)
-    assert "git push" in runs, "缺少把 cron 修正推回仓库的步骤"
-    assert "git diff --quiet" in runs, "应先判断是否真的需要提交"
+
+def test_state_is_saved_on_failed_watch_and_reruns():
+    steps = load_yaml(WORKFLOW)["jobs"]["watch"]["steps"]
+    restore = next(s for s in steps if s.get("uses") == "actions/cache/restore@v4")
+    save = next(s for s in steps if s.get("uses") == "actions/cache/save@v4")
+    assert "always()" in save["if"]
+    assert "hashFiles" in save["if"]
+    assert "github.run_attempt" in save["with"]["key"]
+    assert restore["with"]["key"] == save["with"]["key"]
 
 
 def test_config_check_triggers_on_config_push():

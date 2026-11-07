@@ -1,4 +1,4 @@
-"""命令行入口：watch（正式监控）/ probe（接口定型）/ smoke（连通性验证）。"""
+"""CLI commands and watch orchestration; domain logic lives in dedicated modules."""
 
 from __future__ import annotations
 
@@ -7,26 +7,26 @@ import json
 import logging
 import os
 import sys
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-import yaml
-
+from .config import DEFAULT_CONFIG, load_config
+from .dedup import pick_fresh as _pick_fresh
+from .alerts import FAILURE_ALERT_THRESHOLD, handle_error as _handle_error
+from .messages import CycleLog, render_message, _court_key
+from .health import check_stale, report as health_report, write_summary
 from .availability import AVAILABLE_STATUS, fetch_resources, fetch_slots, probe
 from .ehall import (
     BASE_URL,
     ApiError,
     AuthExpired,
     EhallClient,
-    EhallError,
     SchemaChanged,
     TransportError,
 )
 from .matcher import Hit, Slot, drop_started, select
 from .notify import ConsoleNotifier, NotifyError, build_notifier
 from .schedule import (
-    FREE_MINUTES_PER_MONTH,
     cron_expression,
     daily_runs,
     describe,
@@ -37,27 +37,9 @@ from .schedule import (
     plan_targets,
 )
 from .state import State
-from .timeutil import DEFAULT_ACTIVE_HOURS, active_window, in_active_window, now, weekday_cn
+from .timeutil import DEFAULT_ACTIVE_HOURS, TZ, in_active_window, now, weekday_cn
 
 log = logging.getLogger("court")
-
-DEFAULT_CONFIG = "config.yaml"
-FAILURE_ALERT_THRESHOLD = 6  # 连续 6 次失败（约 30 分钟）才打扰人
-
-
-# --------------------------------------------------------------------- 配置
-def load_config(path: str | Path = DEFAULT_CONFIG) -> dict[str, Any]:
-    file = Path(path)
-    if not file.exists():
-        raise SystemExit(f"找不到配置文件 {file}")
-    try:
-        data = yaml.safe_load(file.read_text(encoding="utf-8")) or {}
-    except yaml.YAMLError as exc:
-        # 缩进错/引号没闭合是最常见的低级错，给出可读信息而不是 traceback
-        raise SystemExit(f"{file} 不是合法的 YAML（多半是缩进或引号）：{exc}") from exc
-    if not isinstance(data, dict):
-        raise SystemExit(f"配置文件 {file} 顶层必须是映射")
-    return data
 
 
 def _env(name: str) -> str | None:
@@ -98,7 +80,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     if not in_active_window(moment, active_hours):
         log.info(
-            "北京时间 %s 不在查询窗口 %s-%s（系统关闭时段），本次不查询、不推送",
+            "北京时间 %s 不在扫描窗口 %s-%s，本次不查询场地",
             moment.strftime("%Y-%m-%d %H:%M"),
             active_hours[0],
             active_hours[1],
@@ -111,7 +93,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     hall_id = venue.get("hall_id", 54)
     matching = cfg.get("matching") or {}
 
-    # 盯场表：周几 + 该周几的时段。每天都跑，但只查"该周几的下一次"
+    # 盯场表映射到本周尚未过去的日期。
     try:
         rules = parse_schedule(cfg.get("schedule"))
     except ValueError as exc:
@@ -144,16 +126,21 @@ def cmd_watch(args: argparse.Namespace) -> int:
     elif not announce:
         state.schedule_fingerprint = current_fingerprint
     elif getattr(notifier, "delivers", False) or args.dry_run:
-        _announce_schedule(notifier, rules, moment)
-        if getattr(notifier, "delivers", False) and not args.dry_run:
+        delivered = _announce_schedule(notifier, rules, moment)
+        if delivered and not args.dry_run:
             state.schedule_fingerprint = current_fingerprint
     else:
         log.warning("盯场表有变化，但当前通道不投递，先不记账")
 
+    if not args.dry_run:
+        check_stale(state, moment, active_hours, notifier)
+    state.health.setdefault("first_attempt_at", moment.isoformat(timespec="seconds"))
+    state.health.update(last_attempt_at=moment.isoformat(timespec="seconds"), status="running",
+                        notification="not_attempted", days=0, fetched=0, hits=0)
     try:
         client = build_client(cfg)
     except SystemExit as exc:
-        # 少配一个 Secret 不该让任务每 5 分钟失败一次（一天 144 封失败邮件）
+        # 缺少 Secret 通过状态和告警反馈，避免每轮都触发失败邮件。
         if isinstance(notifier, ConsoleNotifier):
             raise
         message = str(exc)
@@ -203,6 +190,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             )
             cycle.add_day(target, len(slots), len(kept), len(day_hits))
             hits.extend(day_hits)
+            state.health.update(days=index + 1, fetched=fetched, hits=len(hits))
             if args.sleep_between and index < len(targets) - 1:
                 _sleep(args.sleep_between)
     except AuthExpired as exc:
@@ -213,6 +201,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
     hits.sort(key=lambda hit: (hit.date, hit.start, hit.resource_name))
     log.info("共取到 %d 格（%d 天），命中 %d 处", fetched, len(targets), len(hits))
 
+    state.record_success()
+    state.auth_alert_on = None
+    state.health_alert_at = None
+    state.health.update(status="ok", last_success_at=moment.isoformat(timespec="seconds"),
+                        days=len(targets), fetched=fetched, hits=len(hits), last_error=None)
     fresh, released = _pick_fresh(hits, all_slots, state, hall_id, moment)
     log.info(
         "命中 %d 处；其中新释放的格子 %d 个、需推送的段 %d 处",
@@ -224,7 +217,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if not fresh:
         state.record_success()
         if not args.dry_run:
+            state.health["notification"] = "not_needed" if getattr(notifier, "delivers", False) else "unconfigured"
             state.save(state_path)
+            write_summary(state)
         return 0
 
     title, body = render_message(fresh, hall_id, moment, notify_cfg.get("detail_url"))
@@ -233,194 +228,33 @@ def cmd_watch(args: argparse.Namespace) -> int:
         notifier.send(title, body, notify_cfg.get("detail_url"))
     except NotifyError as exc:
         log.error("推送失败：%s", exc)
-        state.record_failure()
+        state.health.update(notification="failed", notification_error=str(exc))
         if not args.dry_run:
             state.save(state_path)
+            write_summary(state)
         return 1
 
     state.record_success()
     if not args.dry_run:
         if getattr(notifier, "delivers", False):
+            state.health.update(notification="sent", notification_error=None, last_notification_at=moment.isoformat(timespec="seconds"))
             for hit in fresh:
                 for slot in hit.slots:
                     state.mark_notified(slot.key(hall_id), moment)
         else:
             # 没配 SPT / dry-run：消息没真正投递，不能记账，否则配好后会漏推
+            state.health["notification"] = "unconfigured"
             log.warning("本轮未真正投递，不记录已推送状态，下次仍会重试这批空场")
         state.save(state_path)
+        write_summary(state)
     return 0
-
-
-def _pick_fresh(
-    hits: list[Hit],
-    all_slots: list[Slot],
-    state: State,
-    hall_id,
-    moment: datetime,
-) -> tuple[list[Hit], int]:
-    """按**单个场次格子**判定新鲜度，并更新占用状态。
-
-    对应你的要求：「设定时间内，有占用的场变为空场，就通知」。
-
-      规则 A（捡漏）：上次观察到占用/不可约，这次可用 → 必定通知，
-                     即使这个格子以前推过（被抢走又被释放，算新机会）。
-      规则 B（首次）：一直可用、但从未推送过 → 通知。
-      规则 C（常态）：一直可用、且已推过 → 不通知，避免每 5 分钟刷屏。
-      规则 D（占回）：本轮不可用 → 记入占用集合，等它释放时触发规则 A。
-
-    必须先读旧状态再更新，否则 mark_free 会提前抹掉"上次是占用"这个事实。
-    """
-    # ---- 阶段一：读旧状态，判定哪些格子新鲜
-    was_occupied: dict[str, bool] = {}
-    notified: dict[str, bool] = {}
-    for slot in all_slots:
-        key = slot.key(hall_id)
-        was_occupied[key] = state.was_occupied(key)
-        notified[key] = state.already_notified(key)
-
-    # ---- 阶段二：更新状态（占用/空闲），供下一轮使用
-    released = 0
-    for slot in all_slots:
-        key = slot.key(hall_id)
-        if slot.available:
-            if was_occupied[key]:
-                released += 1
-            state.mark_free(key)
-        else:
-            state.mark_occupied(key, moment)
-
-    # ---- 阶段三：挑出需要推送的格子
-    def is_new(key: str) -> bool:
-        if was_occupied[key]:
-            return True          # 规则 A
-        return not notified[key]  # 规则 B
-
-    fresh_hits = [
-        hit for hit in hits if any(is_new(s.key(hall_id)) for s in hit.slots)
-    ]
-    return fresh_hits, released
-
-
-def _handle_error(
-    state: State,
-    state_path: Path,
-    notifier,
-    moment: datetime,
-    exc: Exception,
-    *,
-    kind: str,
-) -> int:
-    log.error("%s：%s", type(exc).__name__, exc)
-
-    if kind in {"auth", "config"}:
-        today = moment.date().isoformat()
-        if state.auth_alert_on != today:  # 每天最多打扰一次
-            if kind == "auth":
-                title = "⚠️ ehall 登录态失效"
-                body = (
-                    "预约系统 Cookie 已过期，监控已暂停。\n\n"
-                    "**恢复步骤**\n"
-                    "1. 浏览器打开预约页并登录\n"
-                    "2. F12 → Network → 任一 `site/reservation` 请求 → 复制 Cookie\n"
-                    "3. 更新 GitHub Secret `EHALL_COOKIE`（UA 变了同时更新 `EHALL_UA`）\n\n"
-                    f"失效时间：{moment.strftime('%Y-%m-%d %H:%M')}"
-                )
-            else:
-                title = "⚠️ 监控缺少配置"
-                body = (
-                    "缺少环境变量 `EHALL_COOKIE`，监控没有启动。\n\n"
-                    "**修复**\n"
-                    "仓库 Settings → Secrets and variables → Actions → 添加：\n"
-                    "- `EHALL_COOKIE`：浏览器 Cookie\n"
-                    "- `EHALL_UA`：同一浏览器的 User-Agent\n\n"
-                    f"时间：{moment.strftime('%Y-%m-%d %H:%M')}"
-                )
-            try:
-                notifier.send(title, body, None)
-                state.auth_alert_on = today
-            except NotifyError as notify_exc:
-                log.error("告警推送失败：%s", notify_exc)
-    else:
-        count = state.record_failure()
-        if count == FAILURE_ALERT_THRESHOLD:
-            try:
-                notifier.send(
-                    "⚠️ 场地监控连续失败",
-                    f"已连续 {count} 次请求失败（约 {count * 5} 分钟），最后一次错误：\n\n"
-                    f"`{type(exc).__name__}: {exc}`\n\n"
-                    "可能是接口改版、校园网抖动或系统维护。",
-                    None,
-                )
-            except NotifyError as notify_exc:
-                log.error("失败告警推送失败：%s", notify_exc)
-
-    if not isinstance(notifier, ConsoleNotifier):
-        state.save(state_path)
-    return 0
-
-
-# --------------------------------------------------------------------- 渲染
-def render_message(
-    hits: list[Hit],
-    hall_id: Any,
-    moment: datetime,
-    detail_url: str | None,
-    *,
-    max_items: int = 30,
-) -> tuple[str, str]:
-    """按「日期 → 时段」聚合，用场地数代替逐条罗列，避免一条消息几十行。"""
-    if not hits:
-        body = f"目标时段暂无可约场地。\n\n_查询时间 {moment.strftime('%m-%d %H:%M')} · 场馆 {hall_id}_"
-        return "🏸 暂无空场", body
-
-    by_day: dict[date, dict[tuple, list[str]]] = {}
-    for hit in hits:
-        by_day.setdefault(hit.date, {}).setdefault((hit.start, hit.end), []).append(hit.resource_name)
-
-    total_spans = sum(len(spans) for spans in by_day.values())
-    lines = [f"### 🏸 {len(by_day)} 天共 {total_spans} 个时段有空场", ""]
-
-    shown = 0
-    for day in sorted(by_day):
-        lines.append(f"**{day.strftime('%m-%d')} 周{weekday_cn(day)}**")
-        for (start, end), names in sorted(by_day[day].items()):
-            if shown >= max_items:
-                break
-            ordered = sorted(names, key=_court_key)
-            preview = "、".join(ordered[:4]) + ("…" if len(ordered) > 4 else "")
-            lines.append(f"- {start.strftime('%H:%M')}-{end.strftime('%H:%M')} · {len(ordered)} 块（{preview}）")
-            shown += 1
-        lines.append("")
-
-    if total_spans > shown:
-        lines.append(f"…另有 {total_spans - shown} 个时段未列出")
-        lines.append("")
-
-    lines.append(f"_查询时间 {moment.strftime('%m-%d %H:%M')} · 场馆 {hall_id}_")
-    body = "\n".join(lines).strip()
-
-    first_day = min(by_day)
-    title = f"🏸 {first_day.strftime('%m-%d')} 起 {total_spans} 个时段有空场"
-    return title[:100], body
-
-
-def _court_key(name: str) -> tuple[int, str]:
-    """让 1号、2号、10号 按数字排，而不是字典序。"""
-    digits = ""
-    for char in name:
-        if char.isdigit():
-            digits += char
-        else:
-            break
-    return (int(digits) if digits else 9999, name)
 
 
 # --------------------------------------------------------------------- announce
 def cmd_announce(args: argparse.Namespace) -> int:
     """配置一推送就把"当前生效的盯场表"发到手机。
 
-    独立于 watch：即使定时任务被 GitHub 丢弃，这条也能在 push 后几秒内反馈，
-    用来区分"改动没生效"和"任务根本没跑"。
+    独立于 watch；这条通知只确认仓库配置，不验证外部调度器的计划。
     """
     cfg = load_config(args.config)
     try:
@@ -460,7 +294,10 @@ def cmd_announce(args: argparse.Namespace) -> int:
     except NotifyError as exc:
         print(f"✗ 推送失败：{exc}")
         return 1
-    print("✓ 已推送当前盯场表")
+    if not args.dry_run and not getattr(notifier, "delivers", False):
+        print("✗ 未实际推送：缺少 WXPUSHER_SPT")
+        return 1
+    print("✓ 已预览当前盯场表" if args.dry_run else "✓ 已推送当前盯场表")
     return 0
 
 
@@ -532,10 +369,7 @@ def cmd_smoke(args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------- check
 def cmd_check(args: argparse.Namespace) -> int:
-    """本地自检：配置能不能解析、今天会查什么、cron 是否跟扫描窗口同步。
-
-    push 之前跑一遍，缩进错、时窗写反、cron 忘改都能当场发现。
-    """
+    """Validate config and print the intended external schedule without network access."""
     config_path = Path(args.config)
     try:
         cfg = load_config(config_path)
@@ -552,7 +386,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
 
     active_hours = tuple(cfg.get("active_hours") or DEFAULT_ACTIVE_HOURS)
-    interval = int(cfg.get("scan_interval_minutes", 15))
+    interval = int(cfg.get("scan_interval_minutes", 5))
     moment = _resolve_now(args.now)
 
     print(f"✓ 配置可解析：{config_path}")
@@ -566,23 +400,27 @@ def cmd_check(args: argparse.Namespace) -> int:
     per_day = daily_runs(active_hours, interval)
     per_month = monthly_minutes(active_hours, interval)
     print(f"  查询间隔：{interval} 分钟 → {per_day} 次/天")
-    print(f"  cron-job.org 计划：*/{interval} {_bj_hours_spec(active_hours)} * * *（时区 Asia/Shanghai）")
-    print(f"  额度估算：约 {per_month} 分钟/月（按 31 天；public 仓库不计分钟）")
-
-    if per_month > FREE_MINUTES_PER_MONTH:
-        print(
-            f"  ⚠ 约 {per_month} 分钟/月，超过私有仓库额度；"
-            "仓库为 public 时不计分钟，可忽略"
-        )
-    else:
-        print(f"  ✓ 额度余量 {FREE_MINUTES_PER_MONTH - per_month} 分钟（私有仓库口径）")
+    print(f"  cron-job.org 计划：{cron_expression(active_hours, interval, utc=False)}（时区 Asia/Shanghai）")
+    print("  请人工核对外部调度器；check 不读取或修改 cron-job.org 配置。")
+    print(f"  运行规模：{per_day} 次/天，按 31 天最多 {per_month} 次/月（不含额外手动运行）")
+    print("  此处估算运行次数；实际费用取决于仓库方案、runner 类型和作业时长。")
 
     workflow = config_path.parent / ".github" / "workflows" / "watch.yml"
     if not workflow.exists():
         return 0
 
-    text = workflow.read_text(encoding="utf-8")
-    if "- cron:" in text:
+    import yaml
+    try:
+        document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            raise ValueError("workflow 顶层必须是映射")
+        triggers = document.get("on", document.get(True))
+        if not isinstance(triggers, dict) or "workflow_dispatch" not in triggers:
+            raise ValueError("watch.yml 必须配置 workflow_dispatch")
+    except (OSError, yaml.YAMLError, ValueError) as exc:
+        print(f"✗ workflow 配置有误：{exc}")
+        return 1
+    if "schedule" in triggers:
         # 调度已迁到 cron-job.org；watch.yml 里残留 schedule 会形成两套定时器。
         print("✗ watch.yml 仍有 cron 行：调度已交给 cron-job.org，请删除 schedule 触发")
         return 1
@@ -591,12 +429,11 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
-def _bj_hours_spec(active_hours) -> str:
-    """把北京时间的窗口转成 cron-job.org 的小时字段（它可设 Asia/Shanghai 时区）。"""
-    start, end = active_window(active_hours)
-    first = start.hour
-    last = (end.hour - 1) % 24
-    return f"{first}-{last}" if first <= last else "*"
+def cmd_status(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    state = State.load(_state_path(cfg))
+    print(health_report(state))
+    return 0
 
 
 # --------------------------------------------------------------------- 工具
@@ -690,47 +527,7 @@ def _filter_slots(slots: list[Slot], resource_ids: list[str], moment: datetime) 
     return kept
 
 
-class CycleLog:
-    """收集一轮运行的关键数字，作为推送附录，便于事后定位"为什么没报"。"""
-
-    def __init__(self, moment: datetime) -> None:
-        self.started = moment
-        self.days: list[dict[str, object]] = []
-        self.notes: list[str] = []
-
-    def add_day(self, target, fetched: int, kept: int, hits: int) -> None:
-        self.days.append(
-            {"label": target.label, "fetched": fetched, "kept": kept, "hits": hits}
-        )
-
-    def note(self, text: str) -> None:
-        self.notes.append(text)
-
-    @property
-    def total_fetched(self) -> int:
-        return sum(int(d["fetched"]) for d in self.days)
-
-    @property
-    def total_hits(self) -> int:
-        return sum(int(d["hits"]) for d in self.days)
-
-    def appendix(self) -> str:
-        """极简表格：每天取到多少格、留下多少、命中多少。"""
-        lines = [
-            "",
-            "---",
-            f"**运行日志** {self.started.strftime('%m-%d %H:%M')}",
-        ]
-        for day in self.days:
-            lines.append(
-                f"- {day['label']}：取到 {day['fetched']} 格 → 可用 {day['kept']} → 命中 {day['hits']}"
-            )
-        for note in self.notes:
-            lines.append(f"- {note}")
-        return "\n".join(lines)
-
-
-def _announce_schedule(notifier, rules, moment: datetime) -> None:
+def _announce_schedule(notifier, rules, moment: datetime) -> bool:
     """盯场表变化时推一条，让人一眼看到线上到底在盯什么。"""
     body = "\n".join(f"- {rule.label}" for rule in rules)
     message = (
@@ -740,8 +537,10 @@ def _announce_schedule(notifier, rules, moment: datetime) -> None:
     )
     try:
         notifier.send("⚙️ 盯场表已更新", message, None)
+        return bool(getattr(notifier, "delivers", False))
     except NotifyError as exc:
         log.error("盯场表通知推送失败：%s", exc)
+        return False
 
 
 def _resolve_now(value: str | None) -> datetime:
@@ -749,10 +548,8 @@ def _resolve_now(value: str | None) -> datetime:
         return now()
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
-        from .timeutil import TZ
-
         parsed = parsed.replace(tzinfo=TZ)
-    return parsed
+    return parsed.astimezone(TZ)
 
 
 def _sleep(seconds: float) -> None:
@@ -784,7 +581,7 @@ def build_parser() -> argparse.ArgumentParser:
     smoke = sub.add_parser("smoke", help="连通性验证（GitHub Actions 首次部署用）")
     smoke.set_defaults(func=cmd_smoke)
 
-    check = sub.add_parser("check", help="本地自检：配置能否解析、cron 是否同步")
+    check = sub.add_parser("check", help="校验配置并打印外部调度计划（不自动同步）")
     check.add_argument("--now", help="伪造当前时间（ISO8601）")
     check.set_defaults(func=cmd_check)
 
@@ -792,6 +589,8 @@ def build_parser() -> argparse.ArgumentParser:
     announce.add_argument("--now", help="伪造当前时间（ISO8601）")
     announce.add_argument("--dry-run", action="store_true", help="只打印不推送")
     announce.set_defaults(func=cmd_announce)
+    status = sub.add_parser("status", help="查看本地状态文件中的最近扫描结果")
+    status.set_defaults(func=cmd_status)
     return parser
 
 

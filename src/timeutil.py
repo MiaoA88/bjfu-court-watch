@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo("Asia/Shanghai")
 
 # 兜底默认值，config.yaml 的 active_hours 会覆盖它
-DEFAULT_ACTIVE_HOURS = ("09:00", "20:00")
+DEFAULT_ACTIVE_HOURS = ("10:00", "23:00")
 
 
 def now() -> datetime:
@@ -24,7 +24,7 @@ def parse_hhmm(value: str) -> time:
     """把 "09:00" 解析为 time；容忍前后空格与单个数字的小时。"""
     text = str(value).strip()
     parts = text.split(":")
-    if len(parts) < 2:
+    if len(parts) != 2:
         raise ValueError(f"时间格式应为 HH:MM，收到 {value!r}")
     return time(int(parts[0]), int(parts[1]))
 

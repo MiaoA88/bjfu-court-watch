@@ -70,12 +70,17 @@ class WxPusherSpt:
         except requests.RequestException as exc:
             raise NotifyError(f"推送请求失败：{exc}") from exc
 
+        status = getattr(response, "status_code", 200)
+        if not 200 <= status < 300:
+            raise NotifyError(f"推送返回 HTTP {status}")
         body = getattr(response, "text", "") or ""
         try:
             result = json.loads(body)
         except json.JSONDecodeError as exc:
             raise NotifyError(f"推送返回非 JSON：{body[:200]!r}") from exc
 
+        if not isinstance(result, dict):
+            raise NotifyError("推送响应必须是 JSON 对象")
         code = result.get("code")
         if code != SUCCESS_CODE:
             raise NotifyError(f"推送被拒绝：code={code} msg={result.get('msg')!r}")

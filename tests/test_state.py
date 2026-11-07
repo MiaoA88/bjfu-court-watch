@@ -68,3 +68,28 @@ def test_saved_payload_carries_schema_version(tmp_path):
     State().save(path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["schema_version"] == SCHEMA_VERSION
+
+
+def test_legacy_state_load_preserves_dedup(tmp_path):
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps({"schema_version": 1, "notified": {"key": "date"},
+                                "occupied": {"key": "date"}}), encoding="utf-8")
+    state = State.load(path)
+    assert state.notified == {"key": "date"}
+    assert state.occupied == {"key": "date"}
+    assert state.pending == {} and state.health == {}
+
+
+def test_pending_prune_and_acknowledgement(tmp_path):
+    state = State(pending={"54|2026-11-01|18:00|19:00|1": "x"})
+    assert state.prune(date(2026, 11, 2)) == 1
+    state.pending["key"] = "x"
+    state.mark_notified("key", datetime(2026, 11, 2))
+    assert not state.pending
+
+
+def test_corrupt_failure_counter_does_not_discard_notified(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"notified": {"key": "date"}, "consecutive_failures": "bad"}), encoding="utf-8")
+    state = State.load(path)
+    assert state.notified == {"key": "date"} and state.consecutive_failures == 0

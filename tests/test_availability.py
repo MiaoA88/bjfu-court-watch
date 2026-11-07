@@ -1,4 +1,8 @@
 from datetime import date, time
+from copy import deepcopy
+
+import pytest
+from src.ehall import SchemaChanged
 
 from src.availability import (
     parse_clock,
@@ -108,10 +112,14 @@ def test_custom_available_status_is_respected():
     assert [s.available for s in slots] == [False, True, False]
 
 
-def test_missing_table_yields_empty():
-    assert parse_list_page({"list": [{"id": 1, "name": "x"}]}, DAY) == []
-    assert parse_list_page({}, DAY) == []
-    assert parse_list_page(None, DAY) == []
+@pytest.mark.parametrize("payload", [{"list": [{"id": 1, "name": "x"}]}, {}, None])
+def test_missing_schema_is_rejected(payload):
+    with pytest.raises(SchemaChanged):
+        parse_list_page(payload, DAY)
+
+
+def test_explicit_empty_list_is_valid():
+    assert parse_list_page({"total": 0, "list": []}, DAY) == []
 
 
 def test_parse_clock_variants():
@@ -135,3 +143,35 @@ def test_parse_remaining_variants():
     assert parse_remaining("剩余 2 人") == 2
     assert parse_remaining(True) == 1
     assert parse_remaining("") is None
+
+
+@pytest.mark.parametrize("field,value", [("status", None), ("status", "bad"), ("status", True),
+                                          ("status", 1.5), ("margin", None), ("margin", -1)])
+def test_invalid_cell_numbers_are_schema_errors(field, value):
+    payload = deepcopy(PAYLOAD)
+    payload["list"][0]["table"]["595"][0]["row"][field] = value
+    with pytest.raises(SchemaChanged):
+        parse_list_page(payload, DAY)
+
+
+@pytest.mark.parametrize("field,value", [("yaxis", "bad"), ("date", "2026-99-99"),
+                                          ("abscissa", ""), ("row", [])])
+def test_invalid_cell_structure_is_not_silently_skipped(field, value):
+    payload = deepcopy(PAYLOAD)
+    payload["list"][0]["table"]["595"][0][field] = value
+    with pytest.raises(SchemaChanged):
+        parse_list_page(payload, DAY)
+
+
+def test_incomplete_page_is_rejected():
+    with pytest.raises(SchemaChanged, match="分页"):
+        parse_list_page({"total": 2, "list": []}, DAY)
+
+
+def test_fetch_rejects_wrong_day():
+    from src.availability import fetch_slots
+    class Client:
+        def data(self, *a, **kw):
+            return PAYLOAD
+    with pytest.raises(SchemaChanged, match="日期"):
+        fetch_slots(Client(), hall_id=54, day=date(2026, 11, 4))

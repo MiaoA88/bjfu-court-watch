@@ -3,7 +3,7 @@
 GitHub Actions 的 runner 是一次性的，状态必须外置。这里用一个小 JSON 文件，
 由 workflow 的 actions/cache 负责跨运行传递（见 .github/workflows/watch.yml）。
 
-状态丢失（缓存被驱逐）的后果只是"同一条空场再推一次"，不会漏推，因此可以接受。
+状态丢失时仍可发现当前空场，但可能重复通知；历史健康数据也会丢失。
 """
 
 from __future__ import annotations
@@ -33,6 +33,11 @@ class State:
 
     notified: dict[str, str] = field(default_factory=dict)
     occupied: dict[str, str] = field(default_factory=dict)
+    pending: dict[str, str] = field(default_factory=dict)
+    health: dict[str, Any] = field(default_factory=dict)
+    failure_alert_sent: bool = False
+    failure_alert_attempt_at: str | None = None
+    health_alert_at: str | None = None
     # 连续请求失败次数，用于"失败 6 次才告警"
     consecutive_failures: int = 0
     # 登录态告警的日期（yyyy-mm-dd），用于"每天最多提醒一次"
@@ -51,6 +56,7 @@ class State:
 
     def mark_notified(self, key: str, when: datetime) -> None:
         self.notified[key] = when.isoformat(timespec="seconds")
+        self.pending.pop(key, None)
 
     def was_occupied(self, key: str) -> bool:
         return key in self.occupied
@@ -63,13 +69,13 @@ class State:
         self.occupied.pop(key, None)
 
     def prune(self, today: date) -> int:
-        """丢弃目标日期已过（含今天）的键：过了就永远不会再命中。
+        """丢弃目标日期早于今天的键；今天未开场的记录仍保留。
 
         键格式约定为 hall|date|start|end|resource，第二段是 yyyy-mm-dd。
         occupied 用同一套键格式，一并剪除。
         """
         removed = []
-        for store in (self.notified, self.occupied):
+        for store in (self.notified, self.occupied, self.pending):
             for key in list(store):
                 parts = key.split("|")
                 if len(parts) < 2:
@@ -89,6 +95,8 @@ class State:
     # ---------------------------------------------------------------- 失败计数
     def record_success(self) -> None:
         self.consecutive_failures = 0
+        self.failure_alert_sent = False
+        self.failure_alert_attempt_at = None
 
     def record_failure(self) -> int:
         self.consecutive_failures += 1
@@ -117,10 +125,21 @@ class State:
         notified = raw.get("notified") or {}
         occupied = raw.get("occupied") or {}
         resources = raw.get("resources") or {}
+        pending = raw.get("pending") or {}
+        health = raw.get("health") or {}
+        try:
+            failures = max(0, int(raw.get("consecutive_failures") or 0))
+        except (ValueError, TypeError, OverflowError):
+            failures = 0
         return cls(
             notified={str(k): str(v) for k, v in notified.items()} if isinstance(notified, dict) else {},
             occupied={str(k): str(v) for k, v in occupied.items()} if isinstance(occupied, dict) else {},
-            consecutive_failures=int(raw.get("consecutive_failures") or 0),
+            pending={str(k): str(v) for k, v in pending.items()} if isinstance(pending, dict) else {},
+            health=health if isinstance(health, dict) else {},
+            failure_alert_sent=raw.get("failure_alert_sent") is True,
+            failure_alert_attempt_at=raw.get("failure_alert_attempt_at"),
+            health_alert_at=raw.get("health_alert_at"),
+            consecutive_failures=failures,
             auth_alert_on=raw.get("auth_alert_on") or None,
             resources=resources if isinstance(resources, dict) else {},
             schedule_fingerprint=raw.get("schedule_fingerprint") or None,
@@ -135,6 +154,11 @@ class State:
             "schema_version": self.schema_version,
             "notified": self.notified,
             "occupied": self.occupied,
+            "pending": self.pending,
+            "health": self.health,
+            "failure_alert_sent": self.failure_alert_sent,
+            "failure_alert_attempt_at": self.failure_alert_attempt_at,
+            "health_alert_at": self.health_alert_at,
             "consecutive_failures": self.consecutive_failures,
             "auth_alert_on": self.auth_alert_on,
             "resources": self.resources,

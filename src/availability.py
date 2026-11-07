@@ -30,12 +30,11 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any
 
-from .ehall import EhallClient, EhallError
+from .ehall import EhallClient, EhallError, SchemaChanged
 from .matcher import Slot
 from .timeutil import TZ, now
 
@@ -159,70 +158,82 @@ def parse_remaining(value: Any) -> int | None:
 
 
 # --------------------------------------------------------------------- 专用解析
+def _integer_field(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise SchemaChanged(f"{label} 必须是整数")
+    if isinstance(value, str) and not re.fullmatch(r"[0-9]+", value.strip()):
+        raise SchemaChanged(f"{label} 必须是非负整数")
+    number = int(value)
+    if number < 0:
+        raise SchemaChanged(f"{label} 不能为负数")
+    return number
+
+
+def _page_items(payload: Any) -> list[dict]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("list"), list):
+        raise SchemaChanged("list-page 缺少合法的 list 数组")
+    items = payload["list"]
+    if "total" in payload:
+        total = _integer_field(payload["total"], "total")
+        if total != len(items):
+            raise SchemaChanged("list-page 数据不完整，请检查分页或增大 venue.page_size")
+    if any(not isinstance(item, dict) for item in items):
+        raise SchemaChanged("list-page 的资源必须是对象")
+    return items
+
+
 def parse_list_page(
     payload: Any,
     day: date,
     *,
     available_status: int = AVAILABLE_STATUS,
 ) -> list[Slot]:
-    """解析 list-page 的 table 网格。
-
-    只保留 status==available_status 的格子吗？不——保留全部并带上 status，
-    由 matcher 统一判定，这样日志里能看到"有 84 格、仅 6 格可约"，便于排障。
-    """
-    if not isinstance(payload, dict):
-        return []
-    items = payload.get("list") or payload.get("data") or []
-    if isinstance(items, dict):
-        items = [items]
-
+    """Validate the complete page before accepting any availability observation."""
     slots: list[Slot] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        resource_pk = item.get("id")
-        resource_title = str(item.get("name") or "")
-        table = item.get("table") or {}
+    seen: set[str] = set()
+    for item in _page_items(payload):
+        resource_pk = _integer_field(item.get("id"), "resource.id")
+        table = item.get("table")
         if not isinstance(table, dict):
-            continue
+            raise SchemaChanged(f"资源 {resource_pk} 缺少合法 table 网格")
         for rows in table.values():
             if not isinstance(rows, list):
-                continue
+                raise SchemaChanged("table 每一列必须是数组")
             for cell in rows:
                 if not isinstance(cell, dict):
-                    continue
+                    raise SchemaChanged("场次必须是对象")
                 span = parse_span(cell.get("yaxis"))
-                if span is None:
-                    continue
-                row = cell.get("row") or {}
-                if not isinstance(row, dict):
-                    continue
-                margin = parse_remaining(row.get("margin"))
-                if margin is None:
-                    continue
-                status = parse_remaining(row.get("status"))
-                court = str(cell.get("abscissa") or "").strip() or f"{resource_title}-未知场地"
-                cell_day = parse_day(cell.get("date")) or day
-                slots.append(
-                    Slot(
-                        date=cell_day,
-                        start=span[0],
-                        end=span[1],
-                        resource_id=f"{resource_pk}#{court}",
-                        resource_name=court,
-                        remaining=margin,
-                        capacity=parse_remaining(row.get("total")),
-                        status=status,
-                        available_status=available_status,
-                    )
-                )
+                row = cell.get("row")
+                court = cell.get("abscissa")
+                if span is None or not isinstance(row, dict):
+                    raise SchemaChanged("场次缺少合法 yaxis 或 row")
+                if not isinstance(court, str) or not court.strip():
+                    raise SchemaChanged("场次缺少场地名称 abscissa")
+                margin = _integer_field(row.get("margin"), "row.margin")
+                status = _integer_field(row.get("status"), "row.status")
+                try:
+                    cell_day = parse_day(cell.get("date"))
+                except (ValueError, OverflowError, OSError) as exc:
+                    raise SchemaChanged("场次 date 无效") from exc
+                if cell_day is None:
+                    raise SchemaChanged("场次缺少合法 date")
+                slot = Slot(date=cell_day, start=span[0], end=span[1],
+                            resource_id=f"{resource_pk}#{court.strip()}",
+                            resource_name=court.strip(), remaining=margin,
+                            capacity=_integer_field(row["total"], "row.total") if "total" in row else None,
+                            status=status, available_status=available_status)
+                key = slot.key("")
+                if key in seen:
+                    raise SchemaChanged("接口返回重复的场次格子")
+                seen.add(key)
+                slots.append(slot)
     return slots
 
 
 def summarize_table(payload: Any) -> dict[str, Any]:
     """给日志/自检用：每个资源的场地数、时段数、状态分布。"""
     report: dict[str, Any] = {}
-    items = (payload or {}).get("list") or []
+    items = _page_items(payload)
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -256,6 +267,8 @@ def fetch_slots(
         "GET", LIST_PAGE, params={"hall_id": hall_id, "time": day.isoformat(), "p": 1, "page_size": page_size}
     )
     slots = parse_list_page(payload, day, available_status=available_status)
+    if any(slot.date != day for slot in slots):
+        raise SchemaChanged("接口返回的场次日期与请求日期不符")
     report = summarize_table(payload)
     log.info("%s 取到 %d 格；%s", day, len(slots), json.dumps(report, ensure_ascii=False))
     return slots
@@ -272,7 +285,12 @@ def fetch_resources(client: EhallClient, hall_id: str | int, day: date | None = 
         log.warning("取资源列表失败：%s", exc)
         return []
     out: list[dict[str, str]] = []
-    for item in (payload or {}).get("list") or []:
+    try:
+        items = _page_items(payload)
+    except SchemaChanged as exc:
+        log.warning("资源列表结构异常：%s", exc)
+        return []
+    for item in items:
         if isinstance(item, dict) and item.get("id") is not None:
             out.append({"id": str(item["id"]), "name": str(item.get("name") or "")})
     return out
