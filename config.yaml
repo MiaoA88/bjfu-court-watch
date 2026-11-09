@@ -36,15 +36,15 @@ venue:
 #   只有一个窗口时也可以不写列表：time_windows: "14:00-22:00"。
 schedule:
   - weekday: 1                     # 周一
-    time_windows: ["19:00-22:00"]
+    time_windows: ["15:00-22:00"]
   - weekday: 2                     # 周二
-    time_windows: ["19:00-22:00"]
+    time_windows: ["15:00-22:00"]
   - weekday: 3                     # 周三
-    time_windows: ["19:00-22:00"]
+    time_windows: ["15:00-22:00"]
   - weekday: 4                     # 周四
-    time_windows: ["12:00-22:00"]
+    time_windows: ["15:00-22:00"]
   - weekday: 5                     # 周五
-    time_windows: ["19:00-22:00"]
+    time_windows: ["15:00-22:00"]
   - weekday: 6                     # 周六
     time_windows: ["12:00-22:00"]
   - weekday: 7                     # 周日
