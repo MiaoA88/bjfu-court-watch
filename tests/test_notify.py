@@ -1,6 +1,7 @@
 import json
 
 import pytest
+import requests
 
 from src.notify import (
     MAX_CONTENT_CHARS,
@@ -121,3 +122,33 @@ def test_http_failure_is_not_acknowledged_even_with_success_body():
             return response
     with pytest.raises(NotifyError, match="HTTP 503"):
         WxPusherSpt("SPT_test", session=Session()).send("t", "body")
+
+
+@pytest.mark.parametrize("tokens", ["SPT-xxx;SPT-yyy;SPT-zzz", " SPT-xxx ; ;SPT-yyy;SPT-xxx;SPT-zzz; "])
+def test_multiple_recipients_receive_same_message(tokens):
+    session = FakeSession({"code": 1000})
+    sender = build_notifier("wxpusher_spt", tokens)
+    sender._session = session
+    sender.send("标题", "正文", "https://example.test")
+    assert [call["json"]["spt"] for call in session.calls] == ["SPT-xxx", "SPT-yyy", "SPT-zzz"]
+    assert all(call["json"]["content"] == "正文" and call["json"]["url"] == "https://example.test" for call in session.calls)
+
+
+def test_partial_failure_still_attempts_all_recipients_without_exposing_tokens():
+    class Session(FakeSession):
+        def post(self, url, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["json"]["spt"] == "SPT-secret":
+                raise requests.ConnectionError("SPT-secret")
+            return FakeResponse({"code": 1000})
+    session = Session(None)
+    sender = WxPusherSpt("SPT-first;SPT-secret;SPT-last", session=session)
+    with pytest.raises(NotifyError) as error:
+        sender.send("标题", "正文")
+    assert len(session.calls) == 3
+    assert "2" in str(error.value) and "SPT-secret" not in str(error.value)
+
+
+def test_only_separators_are_not_valid_tokens():
+    with pytest.raises(NotifyError):
+        WxPusherSpt(" ; ; ")

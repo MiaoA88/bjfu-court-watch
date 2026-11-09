@@ -1,6 +1,6 @@
 """推送通道。
 
-默认实现 WxPusher 极简推送（SPT）：只需一个 SPT_ 令牌，不必建应用、不必拿 UID。
+默认实现 WxPusher 极简推送（SPT）：支持用分号分隔多个 SPT 令牌，不必建应用、不必拿 UID。
 接口：POST https://wxpusher.zjiecode.com/api/send/message/simple-push
 body：{spt, content, summary, contentType}，contentType=3 为 Markdown，
 业务成功码 1000。正文上限 40000 字符。
@@ -41,9 +41,9 @@ class WxPusherSpt:
         timeout: float = 10.0,
         session: Any = None,
     ) -> None:
-        if not spt or not spt.strip():
+        self._spts = list(dict.fromkeys(token.strip() for token in (spt or "").split(";") if token.strip()))
+        if not self._spts:
             raise NotifyError("SPT 为空：请配置 WXPUSHER_SPT")
-        self._spt = spt.strip()
         self._timeout = timeout
         self._session = session or requests.Session()
 
@@ -52,7 +52,6 @@ class WxPusherSpt:
         if len(content) > MAX_CONTENT_CHARS:
             content = content[:MAX_CONTENT_CHARS] + "\n\n…（内容过长已截断）"
         payload: dict[str, Any] = {
-            "spt": self._spt,
             "content": content,
             "summary": (title or "场地提醒")[:100],
             "contentType": 3,
@@ -60,6 +59,20 @@ class WxPusherSpt:
         if url:
             payload["url"] = url
 
+        failures = []
+        for index, token in enumerate(self._spts, start=1):
+            try:
+                self._send_one({**payload, "spt": token})
+            except NotifyError as exc:
+                reason = str(exc)
+                for secret in self._spts:
+                    reason = reason.replace(secret, "[SPT]")
+                failures.append(f"用户 {index}：{reason}")
+        if failures:
+            raise NotifyError("推送失败：" + "; ".join(failures))
+        log.info("已推送：%s（%d 个用户）", title, len(self._spts))
+
+    def _send_one(self, payload: dict[str, Any]) -> None:
         try:
             response = self._session.post(
                 SPT_ENDPOINT,
@@ -84,7 +97,6 @@ class WxPusherSpt:
         code = result.get("code")
         if code != SUCCESS_CODE:
             raise NotifyError(f"推送被拒绝：code={code} msg={result.get('msg')!r}")
-        log.info("已推送：%s（WxPusher code=%s）", title, code)
 
 
 class LoggingNotifier:

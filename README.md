@@ -34,9 +34,11 @@ python -m pytest -q
 | --- | --- |
 | `EHALL_COOKIE` | 登录后从浏览器 Network 复制完整 Cookie 值，例如 `route=xxx; PHPSESSID=xxx`；保留实际请求中的其他 Cookie 字段 |
 | `EHALL_UA` | 同一浏览器完整的 User-Agent 值，例如 `Mozilla/5.0 ...`；建议随 Cookie 一起更新 |
-| `WXPUSHER_SPT` | WxPusher 极简推送的完整令牌，格式为 `SPT_...` |
+| `WXPUSHER_SPT` | 一个或多个 WxPusher 极简推送令牌，多个用户用英文分号 `;` 分隔，例如 `SPT-xxx;SPT-yyy;SPT-zzz`（令牌以平台实际发放值为准） |
 
 三个 Secret 均直接填写值，不带 `Cookie:`、`User-Agent:` 等请求头名称，不加外围引号或换行。示例中的 `xxx`、`...` 需要替换成实际值；Cookie 字段间使用 `; ` 分隔，不要只保留示例里的两个字段。
+
+多用户会逐个发送同一条消息，自动去除令牌两端空格、空项和重复项；某个用户发送失败不影响继续尝试其他用户。全部成功后才记为已通知，部分失败时下一轮可能向已收到的用户重复发送，不另增每用户状态。
 
 程序不自动加载 `.env`。不要把密钥写进源码、提交记录或公开日志。
 
