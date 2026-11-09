@@ -274,28 +274,6 @@ def fetch_slots(
     return slots
 
 
-def fetch_resources(client: EhallClient, hall_id: str | int, day: date | None = None) -> list[dict[str, str]]:
-    """取场馆下的资源（羽毛球/乒乓球），用于日志与场地名过滤。"""
-    target = day or now().date()
-    try:
-        payload = client.data(
-            "GET", LIST_PAGE, params={"hall_id": hall_id, "time": target.isoformat(), "p": 1, "page_size": 20}
-        )
-    except EhallError as exc:
-        log.warning("取资源列表失败：%s", exc)
-        return []
-    out: list[dict[str, str]] = []
-    try:
-        items = _page_items(payload)
-    except SchemaChanged as exc:
-        log.warning("资源列表结构异常：%s", exc)
-        return []
-    for item in items:
-        if isinstance(item, dict) and item.get("id") is not None:
-            out.append({"id": str(item["id"]), "name": str(item.get("name") or "")})
-    return out
-
-
 # --------------------------------------------------------------------- 自检
 def probe(
     client: EhallClient | None,

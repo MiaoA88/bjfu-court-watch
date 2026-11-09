@@ -6,6 +6,7 @@ import yaml
 
 from src import cli
 from src.matcher import Hit, Slot
+from src.messages import _court_key
 
 MONDAY = "2026-11-02"      # 周一
 WEDNESDAY = "2026-11-04"   # 周三
@@ -62,19 +63,18 @@ def slot(day, start_hour, end_hour, name="1号塑胶场地", status=1, remaining
 def stub_pipeline(monkeypatch, slots, recorder=None):
     """把网络与推送全部打桩，只留编排逻辑。"""
     recorder = recorder or Recorder()
-    monkeypatch.setattr(cli, "build_client", lambda cfg: object())
-    monkeypatch.setattr(cli, "fetch_resources", lambda client, hall_id: [])
+    monkeypatch.setattr(cli, "build_client", lambda cfg, **kwargs: object())
     monkeypatch.setattr(cli, "fetch_slots", lambda *a, **k: list(slots))
     monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: recorder)
     return recorder
 
 
 # ------------------------------------------------------------------ 闸门：扫描窗口
-def test_outside_active_hours_skips_everything(tmp_path, monkeypatch):
+def test_outside_active_hours_skips_queries(tmp_path, monkeypatch):
     monkeypatch.delenv("EHALL_COOKIE", raising=False)
     cfg = write_config(tmp_path)
     assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T22:00:00")) == 0  # 22:00 右开边界
-    assert not (tmp_path / "state.json").exists(), "窗口外不应写状态"
+    assert (tmp_path / "state.json").exists()
 
 
 def test_empty_schedule_is_fatal(tmp_path):
@@ -106,8 +106,7 @@ def test_runs_on_non_matching_weekday_and_queries_remaining_week(tmp_path, monke
         return [slot(day, 14, 15)]
 
     recorder = Recorder()
-    monkeypatch.setattr(cli, "build_client", lambda cfg: object())
-    monkeypatch.setattr(cli, "fetch_resources", lambda client, hall_id: [])
+    monkeypatch.setattr(cli, "build_client", lambda cfg, **kwargs: object())
     monkeypatch.setattr(cli, "fetch_slots", fake_fetch_slots)
     monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: recorder)
 
@@ -127,7 +126,7 @@ def test_no_remaining_weekday_exits_without_requests(tmp_path, monkeypatch):
     )
     monkeypatch.delenv("EHALL_COOKIE", raising=False)
     assert cli.cmd_watch(make_args(cfg, "2026-11-08T15:00:00")) == 0
-    assert not (tmp_path / "state.json").exists()
+    assert (tmp_path / "state.json").exists()
 
 
 # ------------------------------------------------------------------ 盯场表变更通知
@@ -204,17 +203,17 @@ def test_unopened_slot_is_not_pushed(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------------------ 缺配置
-def test_missing_cookie_alerts_once_per_day(tmp_path, monkeypatch):
+def test_missing_cookie_alerts_once(tmp_path, monkeypatch):
     recorder = Recorder()
     monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: recorder)
     monkeypatch.delenv("EHALL_COOKIE", raising=False)
     cfg = write_config(tmp_path)
 
     assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:00:00")) == 0
-    assert len([t for t, _ in recorder.sent if "配置" in t]) == 1
+    assert len([t for t, _ in recorder.sent if "登录态失效" in t]) == 1
 
     assert cli.cmd_watch(make_args(cfg, f"{MONDAY}T15:05:00")) == 0
-    assert len([t for t, _ in recorder.sent if "配置" in t]) == 1
+    assert len([t for t, _ in recorder.sent if "登录态失效" in t]) == 1
 
 
 # ------------------------------------------------------------------ 本地自检
@@ -302,7 +301,7 @@ def test_render_merges_courts_of_same_span():
     hits = [make_hit(day, 18, name="1号场", rid="156#1"), make_hit(day, 18, name="2号场", rid="156#2")]
     title, body = cli.render_message(hits, 54, cli.now(), None)
 
-    assert "周四起18:00-19:00有空场" in title
+    assert "周四的18:00-19:00等有多个空场" in title
     assert "18:00-19:00 · 2 块（1号场、2号场）" in body
     assert "场馆 54" in body
 
@@ -322,7 +321,7 @@ def test_render_caps_items_and_reports_remainder():
     hits = [make_hit(day, hour, name=f"{hour}号场", rid=f"156#{hour}") for hour in range(12)]
     title, body = cli.render_message(hits, 54, cli.now(), None, max_items=5)
 
-    assert "周四起00:00-01:00有空场" in title
+    assert "周四的00:00-01:00等有多个空场" in title
     assert "另有 7 个时段未列出" in body
 
 
@@ -334,4 +333,4 @@ def test_render_empty_hits():
 
 def test_court_key_sorts_by_leading_number():
     names = ["10号场", "2号场", "1号场", "未知场地"]
-    assert sorted(names, key=cli._court_key) == ["1号场", "2号场", "10号场", "未知场地"]
+    assert sorted(names, key=_court_key) == ["1号场", "2号场", "10号场", "未知场地"]

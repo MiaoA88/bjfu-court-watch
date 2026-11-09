@@ -12,10 +12,8 @@ from pathlib import Path
 from typing import Any
 from .config import DEFAULT_CONFIG, load_config
 from .dedup import pick_fresh as _pick_fresh
-from .alerts import FAILURE_ALERT_THRESHOLD, handle_error as _handle_error
-from .messages import CycleLog, render_message, _court_key
-from .health import check_stale, report as health_report, write_summary
-from .availability import AVAILABLE_STATUS, fetch_resources, fetch_slots, probe
+from .messages import render_message
+from .availability import AVAILABLE_STATUS, fetch_slots, probe
 from .ehall import (
     BASE_URL,
     ApiError,
@@ -25,7 +23,7 @@ from .ehall import (
     TransportError,
 )
 from .matcher import Hit, Slot, drop_started, select
-from .notify import ConsoleNotifier, NotifyError, build_notifier
+from .notify import NotifyError, build_notifier
 from .schedule import (
     cron_expression,
     daily_runs,
@@ -72,182 +70,96 @@ def cmd_watch(args: argparse.Namespace) -> int:
     moment = _resolve_now(args.now)
     active_hours = cfg.get("active_hours") or list(DEFAULT_ACTIVE_HOURS)
     notify_cfg = cfg.get("notify") or {}
-
-    # 每次运行都留一条记录，即使落在窗口外——否则"任务跑了但没发消息"
-    # 和"任务根本没跑"无法区分，排查时只能靠翻 Actions 日志。
-    if not args.dry_run:
-        _heartbeat(moment, in_active_window(moment, active_hours), active_hours)
-
-    if not in_active_window(moment, active_hours):
-        log.info(
-            "北京时间 %s 不在扫描窗口 %s-%s，本次不查询场地",
-            moment.strftime("%Y-%m-%d %H:%M"),
-            active_hours[0],
-            active_hours[1],
-        )
-        # 窗口外也要发一次"今日启动"，说明调度器至少派活过来了
-        _start_notice_if_needed(cfg, notify_cfg, moment, args)
-        return 0
-
-    venue = cfg.get("venue") or {}
-    hall_id = venue.get("hall_id", 54)
-    matching = cfg.get("matching") or {}
-
-    # 盯场表映射到本周尚未过去的日期。
-    try:
-        rules = parse_schedule(cfg.get("schedule"))
-    except ValueError as exc:
-        raise SystemExit(f"schedule 配置有误：{exc}") from exc
+    rules = parse_schedule(cfg.get("schedule"))
     if not rules:
-        raise SystemExit("schedule 为空：请在 config.yaml 里配置要盯的星期与时段")
-
+        raise SystemExit("schedule 为空：请配置要盯的星期与时段")
     targets = plan_targets(rules, moment)
-    log.info("盯场表：%s", describe(rules))
-    if not targets:
-        log.info("本周剩下的日期里没有配置的周几，本次不查询、不推送")
-        return 0
-    log.info("本次要查：%s", describes_targets(targets))
-
     state_path = _state_path(cfg)
     state = State.load(state_path)
     state.prune(moment.date())
-
     notifier = build_notifier(
-        notify_cfg.get("provider", "wxpusher_spt"),
-        _env("WXPUSHER_SPT"),
+        notify_cfg.get("provider", "wxpusher_spt"), _env("WXPUSHER_SPT"),
         dry_run=args.dry_run,
     )
-
-    # 盯场表变了就推一条"当前最新时段"，省得靠人肉确认改动生效没有
-    current_fingerprint = fingerprint(rules)
-    announce = bool(notify_cfg.get("announce_schedule_changes", True))
-    if state.schedule_fingerprint == current_fingerprint:
-        log.info("盯场表未变化（指纹 %s）", current_fingerprint)
-    elif not announce:
-        state.schedule_fingerprint = current_fingerprint
-    elif getattr(notifier, "delivers", False) or args.dry_run:
-        delivered = _announce_schedule(notifier, rules, moment)
-        if delivered and not args.dry_run:
-            state.schedule_fingerprint = current_fingerprint
-    else:
-        log.warning("盯场表有变化，但当前通道不投递，先不记账")
-
-    if not args.dry_run:
-        check_stale(state, moment, active_hours, notifier)
-    state.health.setdefault("first_attempt_at", moment.isoformat(timespec="seconds"))
-    state.health.update(last_attempt_at=moment.isoformat(timespec="seconds"), status="running",
-                        notification="not_attempted", days=0, fetched=0, hits=0)
     try:
-        client = build_client(cfg)
-    except SystemExit as exc:
-        # 缺少 Secret 通过状态和告警反馈，避免每轮都触发失败邮件。
-        if isinstance(notifier, ConsoleNotifier):
-            raise
-        message = str(exc)
-        return _handle_error(state, state_path, notifier, moment, RuntimeError(message), kind="config")
-
-    # 每天第一次运行时发一条"开始运行"，方便确认监控活着
-    _start_notice_if_needed(cfg, notify_cfg, moment, args, state)
-
-    # 资源列表只用于日志，失败不致命
-    if not state.resources.get(str(hall_id)):
-        resources = fetch_resources(client, hall_id)
-        if resources:
-            state.resources[str(hall_id)] = resources
-            log.info("场馆 %s 下发现 %d 个资源：%s", hall_id, len(resources),
-                     "、".join(r["name"] for r in resources[:8]))
-
-    available_status = int(venue.get("available_status", AVAILABLE_STATUS))
-    page_size = int(venue.get("page_size", 20))
-    resource_ids = [str(x) for x in (venue.get("resource_ids") or [])]
-    minimum = int(matching.get("min_consecutive_slots", 1))
-    include = venue.get("resource_name_include") or []
-    exclude = venue.get("resource_name_exclude") or []
-
-    hits: list[Hit] = []
-    all_slots: list[Slot] = []
-    fetched = 0
-    cycle = CycleLog(moment)
-    try:
-        for index, target in enumerate(targets):
-            slots = fetch_slots(
-                client,
-                hall_id=hall_id,
-                day=target.date,
-                page_size=page_size,
-                available_status=available_status,
-            )
-            fetched += len(slots)
-            kept = _filter_slots(slots, resource_ids, moment)
-            all_slots.extend(kept)
-            day_hits = select(
-                kept,
-                target_dates=[target.date],
-                windows=list(target.windows),
-                min_consecutive_slots=minimum,
-                include=include,
-                exclude=exclude,
-            )
-            cycle.add_day(target, len(slots), len(kept), len(day_hits))
-            hits.extend(day_hits)
-            state.health.update(days=index + 1, fetched=fetched, hits=len(hits))
-            if args.sleep_between and index < len(targets) - 1:
-                _sleep(args.sleep_between)
-    except AuthExpired as exc:
-        return _handle_error(state, state_path, notifier, moment, exc, kind="auth")
-    except (ApiError, SchemaChanged, TransportError) as exc:
-        return _handle_error(state, state_path, notifier, moment, exc, kind="other")
-
-    hits.sort(key=lambda hit: (hit.date, hit.start, hit.resource_name))
-    log.info("共取到 %d 格（%d 天），命中 %d 处", fetched, len(targets), len(hits))
-
-    state.record_success()
-    state.auth_alert_on = None
-    state.health_alert_at = None
-    state.health.update(status="ok", last_success_at=moment.isoformat(timespec="seconds"),
-                        days=len(targets), fetched=fetched, hits=len(hits), last_error=None)
-    fresh, released = _pick_fresh(hits, all_slots, state, hall_id, moment)
-    log.info(
-        "命中 %d 处；其中新释放的格子 %d 个、需推送的段 %d 处",
-        len(hits),
-        released,
-        len(fresh),
-    )
-
-    if not fresh:
-        state.record_success()
         if not args.dry_run:
-            state.health["notification"] = "not_needed" if getattr(notifier, "delivers", False) else "unconfigured"
-            state.save(state_path)
-            write_summary(state)
-        return 0
+            _heartbeat(moment, in_active_window(moment, active_hours), active_hours)
+        _start_notice_if_needed(cfg, notifier, state, rules, targets, moment)
 
-    title, body = render_message(fresh, hall_id, moment, notify_cfg.get("detail_url"))
-    body = body + cycle.appendix()
-    try:
-        notifier.send(title, body, notify_cfg.get("detail_url"))
-    except NotifyError as exc:
-        log.error("推送失败：%s", exc)
-        state.health.update(notification="failed", notification_error=str(exc))
-        if not args.dry_run:
-            state.save(state_path)
-            write_summary(state)
-        return 1
+        current_fingerprint = fingerprint(rules)
+        if state.schedule_fingerprint != current_fingerprint:
+            if not notify_cfg.get("announce_schedule_changes", True):
+                state.schedule_fingerprint = current_fingerprint
+            elif _announce_schedule(notifier, rules, moment):
+                state.schedule_fingerprint = current_fingerprint
 
-    state.record_success()
-    if not args.dry_run:
-        if getattr(notifier, "delivers", False):
-            state.health.update(notification="sent", notification_error=None, last_notification_at=moment.isoformat(timespec="seconds"))
+        if not in_active_window(moment, active_hours):
+            log.info("北京时间 %s 不在扫描窗口 %s-%s，本次不查询场地",
+                     moment.strftime("%Y-%m-%d %H:%M"), *active_hours)
+            return 0
+        if not targets:
+            log.info("本周已无目标日期，本次不查询场地")
+            return 0
+        log.info("本次要查：%s", describes_targets(targets))
+        venue = cfg.get("venue") or {}
+        hall_id = venue.get("hall_id", 54)
+        resource_ids = [str(x) for x in (venue.get("resource_ids") or [])]
+        hits: list[Hit] = []
+        all_slots: list[Slot] = []
+        try:
+            # 缺 Cookie 与登录过期共用一次性提醒；普通接口错误只记日志。
+            client = build_client(cfg, require_cookie=False)
+            if client is None:
+                raise AuthExpired("缺少 EHALL_COOKIE")
+            for index, target in enumerate(targets):
+                slots = fetch_slots(
+                    client, hall_id=hall_id, day=target.date,
+                    page_size=int(venue.get("page_size", 20)),
+                    available_status=int(venue.get("available_status", AVAILABLE_STATUS)),
+                )
+                kept = _filter_slots(slots, resource_ids, moment)
+                all_slots.extend(kept)
+                hits.extend(select(
+                    kept, target_dates=[target.date], windows=list(target.windows),
+                    min_consecutive_slots=int((cfg.get("matching") or {}).get("min_consecutive_slots", 1)),
+                    include=venue.get("resource_name_include"),
+                    exclude=venue.get("resource_name_exclude"),
+                ))
+                if args.sleep_between and index < len(targets) - 1:
+                    _sleep(args.sleep_between)
+        except AuthExpired as exc:
+            log.error("登录状态失效：%s", exc)
+            if not state.auth_alert_sent:
+                state.auth_alert_sent = _send_notice(
+                    notifier, "⚠️ ehall 登录态失效",
+                    "请重新登录预约页，复制完整 Cookie 更新 EHALL_COOKIE；浏览器变化时同步更新 EHALL_UA。",
+                )
+            return 0
+        except (ApiError, SchemaChanged, TransportError) as exc:
+            log.error("查询失败：%s：%s", type(exc).__name__, exc)
+            return 0
+
+        # 只有全部日期查询成功，才更新场地去重及登录恢复状态。
+        state.auth_alert_sent = False
+        fresh = _pick_fresh(hits, all_slots, state, hall_id)
+        log.info("共查询 %d 格（%d 天），本次待推送 %d 格",
+                 len(all_slots), len(targets), sum(len(hit.slots) for hit in fresh))
+        if not fresh:
+            return 0
+        title, body = render_message(fresh, hall_id, moment, notify_cfg.get("detail_url"))
+        try:
+            notifier.send(title, body, notify_cfg.get("detail_url"))
+        except NotifyError as exc:
+            log.error("推送失败：%s", exc)
+            return 1
+        if getattr(notifier, "delivers", False) and not args.dry_run:
             for hit in fresh:
                 for slot in hit.slots:
                     state.mark_notified(slot.key(hall_id), moment)
-        else:
-            # 没配 SPT / dry-run：消息没真正投递，不能记账，否则配好后会漏推
-            state.health["notification"] = "unconfigured"
-            log.warning("本轮未真正投递，不记录已推送状态，下次仍会重试这批空场")
-        state.save(state_path)
-        write_summary(state)
-    return 0
+        return 0
+    finally:
+        if not args.dry_run:
+            state.save(state_path)
 
 
 # --------------------------------------------------------------------- announce
@@ -429,13 +341,6 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_status(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
-    state = State.load(_state_path(cfg))
-    print(health_report(state))
-    return 0
-
-
 # --------------------------------------------------------------------- 工具
 def _heartbeat(moment: datetime, in_window: bool, active_hours) -> None:
     """把每次运行写进 GitHub Actions 的 job summary，不推送、不耗额度。
@@ -457,61 +362,35 @@ def _heartbeat(moment: datetime, in_window: bool, active_hours) -> None:
         pass
 
 
-def _start_notice_if_needed(
-    cfg: dict[str, Any],
-    notify_cfg: dict[str, Any],
-    moment: datetime,
-    args,
-    state: "State | None" = None,
-) -> None:
-    """每天首次运行发一条启动通知；窗口外也发，用来证明调度活着。
-
-    传 state 进来时复用它（调用方负责 save），否则自己加载并保存。
-    这样同一次运行里即使调用两次也不会重复推送。
-    """
-    if not notify_cfg.get("announce_start", True):
-        return
-    owns_state = state is None
-    if owns_state:
-        state = State.load(_state_path(cfg))
-    today_key = moment.date().isoformat()
-    if state.started_on == today_key:
-        return
+def _send_notice(notifier, title: str, body: str, url=None) -> bool:
+    """通知成功投递后才记账；失败留待下一轮。"""
     try:
-        rules = parse_schedule(cfg.get("schedule"))
-    except ValueError:
-        return
-    if not rules:
-        return
-
-    notifier = build_notifier(
-        notify_cfg.get("provider", "wxpusher_spt"),
-        _env("WXPUSHER_SPT"),
-        dry_run=args.dry_run,
-    )
-    active_hours = cfg.get("active_hours") or list(DEFAULT_ACTIVE_HOURS)
-    in_window = in_active_window(moment, active_hours)
-    targets = plan_targets(rules, moment)
-
-    lines = ["### ▶️ 今日首次运行", ""]
-    if in_window:
-        lines.append(f"**扫描窗口** {active_hours[0]}-{active_hours[1]}，本次开始查询。")
-    else:
-        lines.append(
-            f"**注意**：本次运行于 {moment.strftime('%H:%M')}，"
-            f"在扫描窗口 {active_hours[0]}-{active_hours[1]} 之外，因此不会查询场地。"
-        )
-    lines += ["", "**本次要查**：" + (describes_targets(targets) if targets else "（本周已无目标）")]
-    lines += ["", f"_启动于 {moment.strftime('%m-%d %H:%M')}_"]
-
-    try:
-        notifier.send("▶️ 场地监控已启动", "\n".join(lines), notify_cfg.get("detail_url"))
-        if getattr(notifier, "delivers", False) and not args.dry_run:
-            state.started_on = today_key
-            if owns_state:
-                state.save(_state_path(cfg))
+        notifier.send(title, body, url)
+        return bool(getattr(notifier, "delivers", False))
     except NotifyError as exc:
-        log.error("启动通知推送失败：%s", exc)
+        log.error("%s推送失败：%s", title, exc)
+        return False
+
+
+def _start_notice_if_needed(cfg, notifier, state, rules, targets, moment) -> None:
+    notify_cfg = cfg.get("notify") or {}
+    today = moment.date().isoformat()
+    if not notify_cfg.get("announce_start", True) or state.started_on == today:
+        return
+    active_hours = cfg.get("active_hours") or list(DEFAULT_ACTIVE_HOURS)
+    if not in_active_window(moment, active_hours):
+        action = "本次在扫描窗口之外，不会查询场地。"
+    elif not targets:
+        action = "本周已无目标，不会查询场地。"
+    else:
+        action = "本次将尝试查询场地。"
+    body = (
+        f"### ▶️ 今日首次运行\n\n**扫描窗口** {active_hours[0]}-{active_hours[1]}，{action}\n\n"
+        f"**盯场表**：{describe(rules)}\n\n**本次要查**：{describes_targets(targets)}\n\n"
+        f"_启动于 {moment:%m-%d %H:%M}_"
+    )
+    if _send_notice(notifier, "▶️ 场地监控已启动", body, notify_cfg.get("detail_url")):
+        state.started_on = today
 
 
 def _filter_slots(slots: list[Slot], resource_ids: list[str], moment: datetime) -> list[Slot]:
@@ -535,12 +414,7 @@ def _announce_schedule(notifier, rules, moment: datetime) -> bool:
         f"{body}\n\n"
         f"_更新于 {moment.strftime('%m-%d %H:%M')}_"
     )
-    try:
-        notifier.send("⚙️ 盯场表已更新", message, None)
-        return bool(getattr(notifier, "delivers", False))
-    except NotifyError as exc:
-        log.error("盯场表通知推送失败：%s", exc)
-        return False
+    return _send_notice(notifier, "⚙️ 盯场表已更新", message)
 
 
 def _resolve_now(value: str | None) -> datetime:
@@ -589,8 +463,6 @@ def build_parser() -> argparse.ArgumentParser:
     announce.add_argument("--now", help="伪造当前时间（ISO8601）")
     announce.add_argument("--dry-run", action="store_true", help="只打印不推送")
     announce.set_defaults(func=cmd_announce)
-    status = sub.add_parser("status", help="查看本地状态文件中的最近扫描结果")
-    status.set_defaults(func=cmd_status)
     return parser
 
 

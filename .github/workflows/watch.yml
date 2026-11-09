@@ -43,7 +43,7 @@ jobs:
           WXPUSHER_SPT: ${{ secrets.WXPUSHER_SPT }}
         run: python -m src.cli watch
 
-      # Persist pending notifications even when sending fails.
+      # Persist observations and successful notices even when sending fails.
       - name: Save state
         if: always() && hashFiles('.state/notified.json') != ''
         uses: actions/cache/save@v4

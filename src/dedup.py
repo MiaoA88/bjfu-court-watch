@@ -1,24 +1,16 @@
-"""Observe availability separately from acknowledging notification delivery."""
-from datetime import datetime
-
-from .matcher import Hit, Slot
+"""按独立格子去重，展示合并不参与记账。"""
+from .matcher import Hit, Slot, select
 from .state import State
 
 
 def pick_fresh(hits: list[Hit], all_slots: list[Slot], state: State,
-               hall_id: str | int, moment: datetime) -> tuple[list[Hit], int]:
-    released = 0
+               hall_id: str | int) -> list[Hit]:
     for slot in all_slots:
-        key = slot.key(hall_id)
-        if slot.available:
-            if state.was_occupied(key):
-                released += 1
-                state.pending[key] = moment.isoformat(timespec="seconds")
-            if not state.already_notified(key):
-                state.pending.setdefault(key, moment.isoformat(timespec="seconds"))
-            state.mark_free(key)
-        else:
-            state.mark_occupied(key, moment)
-            # Retry only opportunities which are still available.
-            state.pending.pop(key, None)
-    return [hit for hit in hits if any(s.key(hall_id) in state.pending for s in hit.slots)], released
+        if not slot.available:
+            state.notified.pop(slot.key(hall_id), None)
+    # 先按完整空场匹配连续场次要求，再取尚未通知的格子重新合并展示。
+    fresh: list[Hit] = []
+    for hit in hits:
+        slots = [s for s in hit.slots if s.key(hall_id) not in state.notified]
+        fresh.extend(select(slots, target_dates=[hit.date], windows=[(hit.start, hit.end)]))
+    return sorted(fresh, key=lambda hit: (hit.date, hit.start, hit.resource_name))

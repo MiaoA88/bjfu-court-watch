@@ -87,7 +87,7 @@ def test_workflows_are_valid_yaml():
 def test_config_check_has_no_repository_write_side_effects():
     workflow = load_yaml(CONFIG_CHECK)
     assert workflow["permissions"]["contents"] == "read"
-    runs = " ".join(str(s.get("run", "")) for s in workflow["jobs"]["announce"]["steps"])
+    runs = " ".join(str(s.get("run", "")) for s in workflow["jobs"]["check"]["steps"])
     assert "git push" not in runs
     assert "git commit" not in runs
 
@@ -113,14 +113,12 @@ def test_config_check_triggers_on_config_push():
     assert "workflow_dispatch" in trigger, "保留手动触发便于排查"
 
 
-def test_config_check_pushes_announcement():
-    workflow = load_yaml(CONFIG_CHECK)
-    steps = workflow["jobs"]["announce"]["steps"]
+def test_config_check_only_validates_without_announcement():
+    steps = load_yaml(CONFIG_CHECK)["jobs"]["check"]["steps"]
     runs = " ".join(str(s.get("run", "")) for s in steps)
-    assert "src.cli check" in runs, "应先校验配置"
-    assert "src.cli announce" in runs, "应推送当前盯场表"
-    env = next(s["env"] for s in steps if s.get("name") == "Announce effective schedule")
-    assert env["WXPUSHER_SPT"] == "${{ secrets.WXPUSHER_SPT }}"
+    assert "src.cli check" in runs
+    assert "src.cli announce" not in runs
+    assert all("WXPUSHER_SPT" not in step.get("env", {}) for step in steps)
 
 
 def test_config_schedule_is_not_empty():

@@ -43,12 +43,12 @@ def render_message(
     lines.append(f"_查询时间 {moment.strftime('%m-%d %H:%M')} · 场馆 {hall_id}_")
     body = "\n".join(lines).strip()
 
-    # 标题直接给出"最近哪个时段能打"，比"从哪天起有几个时段"更好扫读
-    first_day = min(by_day)
-    first_start, first_end = min(by_day[first_day])
+    cells = {slot.key(hall_id): slot for hit in hits for slot in hit.slots}
+    first = min(cells.values(), key=lambda slot: (slot.date, slot.start, slot.resource_name))
+    suffix = "等有多个空场" if len(cells) > 1 else "有空场"
     title = (
-        f"🏸 周{weekday_cn(first_day)}起"
-        f"{first_start.strftime('%H:%M')}-{first_end.strftime('%H:%M')}有空场"
+        f"🏸 周{weekday_cn(first.date)}的"
+        f"{first.start:%H:%M}-{first.end:%H:%M}{suffix}"
     )
     return title[:100], body
 
@@ -62,43 +62,3 @@ def _court_key(name: str) -> tuple[int, str]:
         else:
             break
     return (int(digits) if digits else 9999, name)
-
-
-class CycleLog:
-    """收集一轮运行的关键数字，作为推送附录，便于事后定位"为什么没报"。"""
-
-    def __init__(self, moment: datetime) -> None:
-        self.started = moment
-        self.days: list[dict[str, object]] = []
-        self.notes: list[str] = []
-
-    def add_day(self, target, fetched: int, kept: int, hits: int) -> None:
-        self.days.append(
-            {"label": target.label, "fetched": fetched, "kept": kept, "hits": hits}
-        )
-
-    def note(self, text: str) -> None:
-        self.notes.append(text)
-
-    @property
-    def total_fetched(self) -> int:
-        return sum(int(d["fetched"]) for d in self.days)
-
-    @property
-    def total_hits(self) -> int:
-        return sum(int(d["hits"]) for d in self.days)
-
-    def appendix(self) -> str:
-        """极简表格：每天取到多少格、留下多少、命中多少。"""
-        lines = [
-            "",
-            "---",
-            f"**运行日志** {self.started.strftime('%m-%d %H:%M')}",
-        ]
-        for day in self.days:
-            lines.append(
-                f"- {day['label']}：取到 {day['fetched']} 格 → 保留 {day['kept']} → 命中 {day['hits']}"
-            )
-        for note in self.notes:
-            lines.append(f"- {note}")
-        return "\n".join(lines)

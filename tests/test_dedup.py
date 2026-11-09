@@ -67,8 +67,7 @@ class Harness:
         self.cfg = write_config(tmp_path)
         self.recorder = Recorder()
         self.slots: list[Slot] = []
-        monkeypatch.setattr(cli, "build_client", lambda cfg: object())
-        monkeypatch.setattr(cli, "fetch_resources", lambda client, hall_id: [])
+        monkeypatch.setattr(cli, "build_client", lambda cfg, **kwargs: object())
         monkeypatch.setattr(cli, "fetch_slots", lambda *a, **k: list(self.slots))
         monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: self.recorder)
         self.monkeypatch = monkeypatch
@@ -86,8 +85,7 @@ class Harness:
 def test_scenario_a_new_earlier_slot_is_notified(tmp_path, monkeypatch):
     """已报 21:00@6号，下一轮 20:00@6号 变空 → 要通知。
 
-    注意：20:00 与 21:00 会连成一段，所以消息显示 20:00-22:00，
-    这正是我们要的——新释放的时段被包含在推送里。
+    推送只包含新增的 20:00 格子，不把已通知的 21:00 再次带入。
     """
     h = Harness(tmp_path, monkeypatch)
 
@@ -98,7 +96,8 @@ def test_scenario_a_new_earlier_slot_is_notified(tmp_path, monkeypatch):
     # 再加一个 20:00 的格子（21:00 仍空着）
     _, new = h.run([cell(20), cell(21)])
     assert new == 1, "新释放的 20:00 应该再通知一次"
-    assert "20:00-22:00" in h.recorder.sent[-1][1], "新段应包含新释放的 20:00"
+    assert "20:00-21:00" in h.recorder.sent[-1][1]
+    assert "21:00-22:00" not in h.recorder.sent[-1][1]
 
 
 def test_scenario_b_another_court_same_span_is_notified(tmp_path, monkeypatch):
@@ -173,3 +172,25 @@ def test_unconstrained_window_still_requires_new_cell(tmp_path, monkeypatch):
     assert len(h.recorder.hit_titles) == 1
     _, new = h.run([cell(16), cell(17)])
     assert new == 1
+
+
+@pytest.mark.parametrize("slots,expected", [
+    ([cell(19)], "🏸 周一的19:00-20:00有空场"),
+    ([cell(19), cell(19, "5号塑胶场地")], "🏸 周一的19:00-20:00等有多个空场"),
+    ([cell(20), cell(19)], "🏸 周一的19:00-20:00等有多个空场"),
+])
+def test_title_counts_independent_cells(tmp_path, monkeypatch, slots, expected):
+    h = Harness(tmp_path, monkeypatch)
+    assert h.run(slots) == (0, 1)
+    assert h.recorder.hit_titles == [expected]
+
+
+def test_new_cell_uses_full_run_for_minimum_but_only_notifies_new_cell(tmp_path, monkeypatch):
+    h = Harness(tmp_path, monkeypatch)
+    cfg = yaml.safe_load(h.cfg.read_text(encoding="utf-8"))
+    cfg["matching"] = {"min_consecutive_slots": 2}
+    h.cfg.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    assert h.run([cell(19), cell(20)])[1] == 1
+    assert h.run([cell(19), cell(20), cell(21)])[1] == 1
+    assert h.recorder.hit_titles[-1] == "🏸 周一的21:00-22:00有空场"
+    assert h.run([cell(19), cell(20), cell(21)])[1] == 0

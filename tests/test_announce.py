@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from src import cli
+from src.notify import ConsoleNotifier
 
 
 class Recorder:
@@ -77,7 +78,7 @@ def test_announce_reports_empty_schedule(tmp_path, capsys):
 
 def test_announce_dry_run_does_not_send(tmp_path, monkeypatch):
     """--dry-run 走 ConsoleNotifier：只打印，不发网络请求。"""
-    console = cli.ConsoleNotifier()
+    console = ConsoleNotifier()
     monkeypatch.setattr(cli, "build_notifier", lambda *a, **k: console)
     monkeypatch.setenv("WXPUSHER_SPT", "SPT_test")
     cfg = write_config(tmp_path)

@@ -8,16 +8,14 @@ def test_roundtrip(tmp_path):
     path = tmp_path / "notified.json"
     state = State()
     state.mark_notified("54|2026-11-05|18:00|19:00|7", datetime(2026, 11, 3, 10, 0))
-    state.record_failure()
-    state.auth_alert_on = "2026-11-03"
-    state.resources["54"] = [{"id": "7", "name": "7号场"}]
+    state.auth_alert_sent = True
+    state.started_on = "2026-11-03"
+    state.schedule_fingerprint = "abc"
     state.save(path)
 
     loaded = State.load(path)
     assert loaded.notified == state.notified
-    assert loaded.consecutive_failures == 1
-    assert loaded.auth_alert_on == "2026-11-03"
-    assert loaded.resources["54"] == [{"id": "7", "name": "7号场"}]
+    assert loaded == state
 
 
 def test_missing_file_yields_empty_state(tmp_path):
@@ -55,14 +53,6 @@ def test_prune_removes_malformed_keys():
     assert state.notified == {}
 
 
-def test_failure_counter():
-    state = State()
-    assert state.record_failure() == 1
-    assert state.record_failure() == 2
-    state.record_success()
-    assert state.consecutive_failures == 0
-
-
 def test_saved_payload_carries_schema_version(tmp_path):
     path = tmp_path / "notified.json"
     State().save(path)
@@ -70,26 +60,20 @@ def test_saved_payload_carries_schema_version(tmp_path):
     assert payload["schema_version"] == SCHEMA_VERSION
 
 
-def test_legacy_state_load_preserves_dedup(tmp_path):
+def test_legacy_state_load_preserves_only_delivered_free_cells(tmp_path):
     path = tmp_path / "legacy.json"
-    path.write_text(json.dumps({"schema_version": 1, "notified": {"key": "date"},
-                                "occupied": {"key": "date"}}), encoding="utf-8")
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "notified": {"free": "date", "occupied": "date", "retry": "date"},
+        "occupied": {"occupied": "date"}, "pending": {"retry": "date"},
+        "auth_alert_on": "2026-11-03", "started_on": "2026-11-03",
+        "schedule_fingerprint": "abc", "health": {"status": "ok"},
+    }), encoding="utf-8")
     state = State.load(path)
-    assert state.notified == {"key": "date"}
-    assert state.occupied == {"key": "date"}
-    assert state.pending == {} and state.health == {}
-
-
-def test_pending_prune_and_acknowledgement(tmp_path):
-    state = State(pending={"54|2026-11-01|18:00|19:00|1": "x"})
-    assert state.prune(date(2026, 11, 2)) == 1
-    state.pending["key"] = "x"
-    state.mark_notified("key", datetime(2026, 11, 2))
-    assert not state.pending
-
-
-def test_corrupt_failure_counter_does_not_discard_notified(tmp_path):
-    path = tmp_path / "state.json"
-    path.write_text(json.dumps({"notified": {"key": "date"}, "consecutive_failures": "bad"}), encoding="utf-8")
-    state = State.load(path)
-    assert state.notified == {"key": "date"} and state.consecutive_failures == 0
+    assert state.notified == {"free": "date"}
+    assert state.auth_alert_sent
+    assert state.started_on == "2026-11-03" and state.schedule_fingerprint == "abc"
+    state.save(path)
+    assert set(json.loads(path.read_text(encoding="utf-8"))) == {
+        "schema_version", "notified", "auth_alert_sent", "started_on", "schedule_fingerprint",
+    }

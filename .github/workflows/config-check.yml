@@ -1,6 +1,6 @@
 name: config-check
 
-# Validate config and announce it from the default branch.
+# Validate config; watch is the only automatic schedule announcement entry.
 # External scheduling is configured separately in cron-job.org.
 
 on:
@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 jobs:
-  announce:
+  check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -31,9 +31,3 @@ jobs:
 
       - name: Validate config
         run: python -m src.cli check
-
-      - name: Announce effective schedule
-        if: github.ref_name == github.event.repository.default_branch
-        env:
-          WXPUSHER_SPT: ${{ secrets.WXPUSHER_SPT }}
-        run: python -m src.cli announce
