@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from time import monotonic
 from pathlib import Path
 from typing import Any
 from .config import DEFAULT_CONFIG, load_config
@@ -27,6 +28,7 @@ from .notify import NotifyError, build_notifier
 from .schedule import (
     cron_expression,
     daily_runs,
+    remaining_runs,
     describe,
     describes_targets,
     fingerprint,
@@ -104,6 +106,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
         venue = cfg.get("venue") or {}
         hall_id = venue.get("hall_id", 54)
         resource_ids = [str(x) for x in (venue.get("resource_ids") or [])]
+        if state.scan_on != moment.date().isoformat():
+            state.scan_on = moment.date().isoformat()
+            state.scan_count = 0
+        state.scan_count += 1
+        started = monotonic()
         hits: list[Hit] = []
         all_slots: list[Slot] = []
         try:
@@ -144,9 +151,20 @@ def cmd_watch(args: argparse.Namespace) -> int:
         fresh = _pick_fresh(hits, all_slots, state, hall_id)
         log.info("共查询 %d 格（%d 天），本次待推送 %d 格",
                  len(all_slots), len(targets), sum(len(hit.slots) for hit in fresh))
+        scan_log = (
+            f"- 今日实际扫描：{state.scan_count} 次（含本次及失败尝试）\n"
+            f"- 今日剩余计划扫描：约 {remaining_runs(moment, active_hours, cfg.get('scan_interval_minutes', 5))} 次\n"
+            f"- 扫描窗口：{active_hours[0]}-{active_hours[1]}；计划间隔：{cfg.get('scan_interval_minutes', 5)} 分钟\n"
+            f"- 本次查询：{len(targets)} 个日期；检查 {len(all_slots)} 个未开始的目标资源格子\n"
+            f"- 当前空场：{len({s.key(hall_id) for h in hits for s in h.slots})} 格；新增空场：{sum(len(h.slots) for h in fresh)} 格\n"
+            f"- 本次扫描耗时：{monotonic() - started:.1f} 秒（不含通知投递）"
+        )
+        log.info("扫描记录：\n%s", scan_log)
         if not fresh:
             return 0
-        title, body = render_message(fresh, hall_id, moment, notify_cfg.get("detail_url"))
+        title, body = render_message(
+            fresh, hall_id, moment, notify_cfg.get("detail_url"), all_hits=hits, scan_log=scan_log,
+        )
         try:
             notifier.send(title, body, notify_cfg.get("detail_url"))
         except NotifyError as exc:

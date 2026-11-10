@@ -302,7 +302,7 @@ def test_render_merges_courts_of_same_span():
     title, body = cli.render_message(hits, 54, cli.now(), None)
 
     assert "周四的18:00-19:00等有多个空场" in title
-    assert "18:00-19:00 · 2 块（1号场、2号场）" in body
+    assert "18:00-19:00 · 2 块（**1号场**、**2号场**）" in body
     assert "场馆 54" in body
 
 
@@ -313,7 +313,7 @@ def test_render_sorts_courts_numerically():
         make_hit(day, 18, name="2号场", rid="156#2"),
     ]
     _, body = cli.render_message(hits, 54, cli.now(), None)
-    assert "2号场、10号场" in body
+    assert "**2号场**、**10号场**" in body
 
 
 def test_render_caps_items_and_reports_remainder():

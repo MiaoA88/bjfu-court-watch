@@ -102,10 +102,52 @@ def test_start_notice_even_without_targets_or_when_query_fails(tmp_path, monkeyp
     assert len([t for t, _ in recorder.sent if "启动" in t]) == 1
 
 
-def test_hit_body_contains_details_without_scan_appendix(tmp_path, monkeypatch):
+def test_hit_body_contains_details_and_concise_scan_log(tmp_path, monkeypatch):
     cfg = write_config(tmp_path)
     recorder = stub_pipeline(monkeypatch, [slot(date(2026, 11, 2), 20, 21)])
     cli.cmd_watch(make_args(cfg, "2026-11-02T15:00:00"))
     body = next(b for t, b in recorder.sent if "空场" in t)
     assert "1号塑胶场地" in body and "20:00-21:00" in body
-    assert "运行日志" not in body
+    assert "扫描记录" in body
+    assert "今日实际扫描：1 次" in body
+    assert "今日剩余计划扫描：约 83 次" in body
+
+
+def test_one_new_cell_among_old_cells_has_singular_title_and_bold_only_new(tmp_path, monkeypatch):
+    from test_dedup import Harness, cell
+    h = Harness(tmp_path, monkeypatch)
+    h.run([cell(19), cell(20, "5号场")])
+    assert h.run([cell(19), cell(20, "5号场"), cell(21)])[1] == 1
+    title, body = h.recorder.sent[-1]
+    assert title == "🏸 周一的21:00-22:00有空场"
+    assert "目前的空场有：1 天共 3 个时段、3 个场地时段" in body
+    assert "19:00-20:00 · 1 块（6号塑胶场地）" in body
+    assert "20:00-21:00 · 1 块（5号场）" in body
+    assert "21:00-22:00 · 1 块（**6号塑胶场地**）" in body
+    assert "今日实际扫描：2 次" in body
+    assert "当前空场：3 格；新增空场：1 格" in body
+
+
+def test_multiple_new_courts_same_span_are_both_visible_and_bold(tmp_path, monkeypatch):
+    from test_dedup import Harness, cell
+    h = Harness(tmp_path, monkeypatch)
+    h.run([cell(20, "1号场")])
+    h.run([cell(20, "1号场"), cell(20, "2号场"), cell(20, "3号场")])
+    title, body = h.recorder.sent[-1]
+    assert title == "🏸 周一的20:00-21:00等有多个空场"
+    assert "3 块（1号场、**2号场**、**3号场**）" in body
+
+
+def test_scan_counter_includes_failures_resets_daily_and_ignores_skips(tmp_path, monkeypatch):
+    from src.state import State
+    cfg = write_config(tmp_path, schedule=[{"weekday": 7, "time_windows": ["20:00-22:00"]}])
+    stub_pipeline(monkeypatch, [])
+    def fail(*args, **kwargs):
+        raise TransportError("offline")
+    monkeypatch.setattr(cli, "fetch_slots", fail)
+    for moment in ("2026-11-02T15:00:00", "2026-11-02T15:05:00", "2026-11-02T23:00:00"):
+        cli.cmd_watch(make_args(cfg, moment))
+    assert State.load(tmp_path / "state.json").scan_count == 2
+    cli.cmd_watch(make_args(cfg, "2026-11-03T15:00:00"))
+    state = State.load(tmp_path / "state.json")
+    assert state.scan_count == 1 and state.scan_on == "2026-11-03"

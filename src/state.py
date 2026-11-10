@@ -22,12 +22,14 @@ SCHEMA_VERSION = 1
 
 @dataclass
 class State:
-    """仅保存成功通知的格子及三类通知标记。"""
+    """保存成功通知的格子、通知标记和当天扫描计数。"""
 
     notified: dict[str, str] = field(default_factory=dict)
     auth_alert_sent: bool = False
     schedule_fingerprint: str | None = None
     started_on: str | None = None
+    scan_on: str | None = None
+    scan_count: int = 0
     schema_version: int = SCHEMA_VERSION
 
     def mark_notified(self, key: str, when: datetime) -> None:
@@ -78,6 +80,8 @@ class State:
             auth_alert_sent=raw.get("auth_alert_sent", bool(raw.get("auth_alert_on"))) is True,
             schedule_fingerprint=raw.get("schedule_fingerprint") or None,
             started_on=raw.get("started_on") or None,
+            scan_on=raw.get("scan_on") or None,
+            scan_count=raw.get("scan_count", 0) if type(raw.get("scan_count", 0)) is int else 0,
         )
 
     def save(self, path: str | Path) -> None:
@@ -89,6 +93,8 @@ class State:
             "auth_alert_sent": self.auth_alert_sent,
             "schedule_fingerprint": self.schedule_fingerprint,
             "started_on": self.started_on,
+            "scan_on": self.scan_on,
+            "scan_count": self.scan_count,
         }
         tmp = file.with_suffix(file.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")

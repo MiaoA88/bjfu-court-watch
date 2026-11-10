@@ -251,3 +251,15 @@ def test_timezone_conversion_across_week_boundary():
     rules = parse_schedule([{"weekday": 1, "time_windows": ["20:00-21:00"]}])
     sunday_utc = datetime.fromisoformat("2026-11-08T18:00:00+00:00")
     assert plan_targets(rules, sunday_utc)[0].date == date(2026, 11, 9)
+
+
+@pytest.mark.parametrize("moment,hours,interval,expected", [
+    ("2026-11-10T10:00:00", ["10:00", "23:00"], 5, 155),
+    ("2026-11-10T22:55:30", ["10:00", "23:00"], 5, 0),
+    ("2026-11-10T23:00:00", ["22:00", "06:00"], 5, 11),
+    ("2026-11-10T14:07:00", ["14:00", "15:00"], 7, 7),
+])
+def test_remaining_planned_scans(moment, hours, interval, expected):
+    from src.schedule import remaining_runs
+    from src.cli import _resolve_now
+    assert remaining_runs(_resolve_now(moment), hours, interval) == expected

@@ -85,7 +85,7 @@ class Harness:
 def test_scenario_a_new_earlier_slot_is_notified(tmp_path, monkeypatch):
     """已报 21:00@6号，下一轮 20:00@6号 变空 → 要通知。
 
-    推送只包含新增的 20:00 格子，不把已通知的 21:00 再次带入。
+    标题只计新增的 20:00 格子，正文同时列出新增与原有的空场。
     """
     h = Harness(tmp_path, monkeypatch)
 
@@ -97,7 +97,7 @@ def test_scenario_a_new_earlier_slot_is_notified(tmp_path, monkeypatch):
     _, new = h.run([cell(20), cell(21)])
     assert new == 1, "新释放的 20:00 应该再通知一次"
     assert "20:00-21:00" in h.recorder.sent[-1][1]
-    assert "21:00-22:00" not in h.recorder.sent[-1][1]
+    assert "21:00-22:00" in h.recorder.sent[-1][1]  # 旧空场也列入当前全部空场
 
 
 def test_scenario_b_another_court_same_span_is_notified(tmp_path, monkeypatch):

@@ -75,5 +75,5 @@ def test_legacy_state_load_preserves_only_delivered_free_cells(tmp_path):
     assert state.started_on == "2026-11-03" and state.schedule_fingerprint == "abc"
     state.save(path)
     assert set(json.loads(path.read_text(encoding="utf-8"))) == {
-        "schema_version", "notified", "auth_alert_sent", "started_on", "schedule_fingerprint",
+        "schema_version", "notified", "auth_alert_sent", "started_on", "schedule_fingerprint", "scan_on", "scan_count",
     }

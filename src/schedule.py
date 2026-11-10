@@ -197,3 +197,15 @@ def cron_expression(
     spans.append(str(first) if first == last else f"{first}-{last}")
     step = "*" if interval == 1 else f"*/{interval}"
     return f"{step} {','.join(spans)} * * *"
+
+
+def remaining_runs(moment: datetime, active_hours, interval: int) -> int:
+    """今日当前分钟之后的计划触发数，按 cron */N 每小时重新计数。"""
+    from .timeutil import TZ, in_active_window
+    local = moment.astimezone(TZ)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return sum(
+        in_active_window(midnight + timedelta(minutes=minute), active_hours)
+        and (minute % 60) % interval == 0
+        for minute in range(local.hour * 60 + local.minute + 1, 24 * 60)
+    )
