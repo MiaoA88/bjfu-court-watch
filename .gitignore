@@ -2,7 +2,7 @@
 probe-out/
 .state/
 
-# 早期从学校站点抓的前端资产与接口字典：仅本地留存，公开仓库里不该有
+# 早期从学校站点抓的前端资产与接口字典
 _probe/
 
 # 本机计划任务部署脚本（当前不使用，仅本地备用）
@@ -18,3 +18,8 @@ venv/
 # 本地私密配置（Cookie / SPT 绝不入库）
 .env
 *.local.yaml
+
+# 本地 agent 操作约束
+/AGENT.md
+
+.gitignore
